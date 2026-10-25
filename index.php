@@ -658,25 +658,56 @@ try {
                 $path = $dir . '/' . $gate;
                 $ext = strtolower(pathinfo($path, PATHINFO_EXTENSION));
                 if ((float)$user['balance'] < DIE_COST) jsonOut(['ok' => false, 'error' => 'Saldo insuficiente. Deposite primeiro.']);
+
                 $_SESSION['user_id'] = (int)$user['id'];
                 $_SESSION['username'] = $user['username'];
+
                 $response = '';
+                $response_has_error = false;
+
                 if ($ext === 'php') {
                     $_GET['lista'] = $lista;
                     $_GET['gate']  = $gate;
+                    $GLOBALS['lista'] = $lista;
+
+                    $prev_display = ini_get('display_errors');
+                    ini_set('display_errors', '0');
                     ob_start();
-                    try { include $path; $response = ob_get_clean(); }
-                    catch (Throwable $e) { ob_end_clean(); $response = '❌ Erro: ' . $e->getMessage(); }
+                    try {
+                        include $path;
+                    } catch (Throwable $e) {
+                        $response_has_error = true;
+                        $response = '❌ Erro: ' . $e->getMessage() . ' @ ' . basename($e->getFile()) . ':' . $e->getLine();
+                    } finally {
+                        $buffered = ob_get_clean();
+                        if ($buffered !== false && $buffered !== '') {
+                            $response = $buffered;
+                        }
+                        ini_set('display_errors', $prev_display);
+                    }
+
+                    if ($response === '' || $response === false) {
+                        $response_has_error = true;
+                        $response = '❌ API não retornou nada (die() prematuro?)';
+                    }
                 } else {
-                    $response = shell_exec('python3 ' . escapeshellarg($path) . ' ' . escapeshellarg($lista) . ' 2>&1') ?? '❌ Sem resposta';
+                    $cmd = 'python3 ' . escapeshellarg($path) . ' ' . escapeshellarg($lista) . ' 2>&1';
+                    $response = shell_exec($cmd);
+                    if ($response === null || $response === '') {
+                        $response_has_error = true;
+                        $response = '❌ Sem resposta do Python';
+                    }
                 }
+
                 $rl = strtolower($response);
                 $liveWords = ['✅','aprovada','approved','success','live','autorizado','valid','aprovado','apvd','ativa','active','cvv','saldo'];
                 $isLive = false;
                 foreach ($liveWords as $w) { if (strpos($rl, $w) !== false) { $isLive = true; break; } }
-                if (strpos($response, '❌') === 0) $isLive = false;
+                if (strpos($response, '❌') === 0 || $response_has_error) $isLive = false;
+
                 $cost = $isLive ? LIVE_COST : DIE_COST;
                 if (!userDeductBalance((int)$user['id'], $cost)) jsonOut(['ok' => false, 'error' => 'Saldo insuficiente']);
+
                 $card = $type === 'gate' ? preg_replace('/[^0-9]/', '', explode('|', $lista)[0]) : $lista;
                 $bin = $type === 'gate' ? substr($card, 0, 6) : '';
                 $db = db();
@@ -691,10 +722,12 @@ try {
                 $stmt->bindValue(':re', $response, SQLITE3_TEXT);
                 $stmt->bindValue(':ip', $ip, SQLITE3_TEXT);
                 $stmt->execute();
+
                 $col = $isLive ? 'total_lives' : 'total_dies';
                 $stmt = $db->prepare("UPDATE users SET total_checks = total_checks + 1, $col = $col + 1 WHERE id = :u");
                 $stmt->bindValue(':u', (int)$user['id'], SQLITE3_INTEGER);
                 $stmt->execute();
+
                 $fresh = userById((int)$user['id']);
                 jsonOut(['ok' => true, 'live' => $isLive, 'response' => $response, 'cost' => $cost, 'balance' => (float)$fresh['balance']]);
             }
@@ -704,7 +737,7 @@ try {
     }
 } catch (Throwable $e) {
     error_log('[HIPCTL] ' . $e->getMessage() . ' @ ' . $e->getFile() . ':' . $e->getLine());
-    jsonOut(['ok' => false, 'error' => 'Erro servidor'], 500);
+    jsonOut(['ok' => false, 'error' => 'Erro: ' . $e->getMessage() . ' @ ' . basename($e->getFile()) . ':' . $e->getLine()], 500);
 }
 
 if (isset($_GET['admin']) && !empty($_SESSION['admin'])) {
@@ -757,9 +790,8 @@ h1{font-size:clamp(46px,6.4vw,88px);line-height:.96;letter-spacing:-.075em;margi
 .auth-card:before{content:"";position:absolute;left:35px;right:35px;top:0;height:1px;background:linear-gradient(90deg,transparent,var(--lime),transparent);opacity:.8}
 .card-kicker{color:var(--lime);font-size:10px;letter-spacing:.18em;text-transform:uppercase;font-weight:800;margin-bottom:13px}
 h2{font-size:30px;letter-spacing:-.055em;margin:0 0 9px}.sub{font-size:12px;line-height:1.7;color:var(--muted);margin:0 0 27px}
-.tabs{display:grid;grid-template-columns:1fr 1fr;padding:4px;border:1px solid var(--line);background:#080a09;border-radius:12px;margin-bottom:25px;gap:4px}.tab{border:0;border-radius:9px;padding:11px 8px;background:transparent;color:#8d978e;font:600 12px inherit;cursor:pointer;transition:.2s}.tab.active{background:#20281a;color:var(--lime);box-shadow:inset 0 0 0 1px #c8ff5221}
+.tabs{display:grid;grid-template-columns:1fr 1fr 1fr;padding:4px;border:1px solid var(--line);background:#080a09;border-radius:12px;margin-bottom:25px;gap:4px}.tab{border:0;border-radius:9px;padding:11px 8px;background:transparent;color:#8d978e;font:600 12px inherit;cursor:pointer;transition:.2s}.tab.active{background:#20281a;color:var(--lime);box-shadow:inset 0 0 0 1px #c8ff5221}
 .field{margin:0 0 17px}.field label{display:block;color:#d4dbd4;font-size:11px;font-weight:650;margin-bottom:9px}.input-wrap{position:relative}.input-wrap svg{position:absolute;left:14px;top:50%;transform:translateY(-50%);width:17px;height:17px;color:#758076;pointer-events:none}.field input{width:100%;height:49px;background:#0b0e0c;border:1px solid #ffffff15;border-radius:11px;padding:0 43px;color:#f2f6f1;font:13px inherit;outline:none;transition:border-color .2s,box-shadow .2s}.field input::placeholder{color:#59635b}.field input:focus{border-color:#b7ef4b8c;box-shadow:0 0 0 3px #c8ff5210}.toggle-pass{position:absolute;right:12px;top:50%;transform:translateY(-50%);border:0;background:none;color:#7f8a80;cursor:pointer;padding:5px}.toggle-pass svg{position:static;transform:none;width:17px;height:17px}
-.rowline{display:flex;justify-content:space-between;align-items:center;gap:10px;margin:4px 0 22px;font-size:11px;color:#9aa49b}.remember{display:flex;align-items:center;gap:8px;cursor:pointer}.remember input{accent-color:var(--lime);width:14px;height:14px}.text-link{color:var(--lime);text-decoration:none}.text-link:hover{text-decoration:underline}
 .submit{width:100%;height:51px;border:0;border-radius:11px;background:var(--lime);color:#10150b;font-weight:850;font-size:12px;letter-spacing:.02em;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:10px;transition:transform .2s,box-shadow .2s,background .2s}.submit:hover:not(:disabled){background:#d6ff7a;box-shadow:0 8px 30px #c8ff5220;transform:translateY(-1px)}.submit:disabled{opacity:.6;cursor:not-allowed}.submit svg{width:16px;height:16px}
 .notice{padding:11px 13px;border-radius:10px;font-size:11px;line-height:1.6;margin-bottom:17px;display:none}.notice.error{background:#ff5f5f12;border:1px solid #ff77772c;color:#ffb0a9}.notice.ok{background:#c8ff5210;border:1px solid #c8ff5233;color:#d9fca3}.notice.warn{background:#fbbf2412;border:1px solid #fbbf2430;color:#fde68a}.notice.show{display:block}
 .security{display:flex;align-items:center;justify-content:center;gap:7px;color:#737e74;font-size:10px;margin-top:21px}.security svg{width:13px;height:13px;color:#9dbb79}
@@ -838,7 +870,6 @@ textarea.lista:focus{border-color:var(--lime);box-shadow:0 0 0 3px #c8ff5215}
 @keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.4;transform:scale(.85)}}
 .pix-timer{margin-top:10px;text-align:center;font-size:11px;color:var(--muted);font-family:'Courier New',monospace}
 
-/* ===== ADMIN ===== */
 .admin-wrap{max-width:1400px;margin:0 auto;padding:24px}
 .admin-top{display:flex;align-items:center;justify-content:space-between;padding:16px 24px;margin-bottom:24px;background:rgba(20,25,22,.85);border:1px solid var(--line);border-radius:16px;flex-wrap:wrap;gap:12px}
 .admin-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:20px}
@@ -1105,11 +1136,11 @@ async function api(payload){const r=await fetch('index.php',{method:'POST',heade
 
 function setType(t){curType=t;curGate='';document.querySelectorAll('.type-tab').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.type-tab')[t==='gate'?0:1].classList.add('active');document.getElementById('label-lista').textContent=t==='gate'?'Cartões (NÚMERO|MÊS|ANO|CVV)':'Logins (USUÁRIO:SENHA)';document.getElementById('lista').placeholder=t==='gate'?'4532015112830366|12|2027|123':'usuario:senha';renderGates();document.getElementById('btn-run').disabled=true}
 
-function renderGates(){const box=document.getElementById('gates'),arr=GATES[curType]||[];box.innerHTML='';if(!arr.length){box.innerHTML='<div style="grid-column:1/-1;text-align:center;padding:24px;color:var(--muted);font-size:12px">Nenhum checker em /'+curType+'/</div>';return}arr.forEach(f=>{const d=document.createElement('div');d.className='gate-card';d.innerHTML=`<div class="top"><div class="nm">${f}</div><div class="ext">${f.split('.').pop()}</div></div><div class="tp">${curType==='gate'?'Cartão':'Login'}</div>`;d.onclick=()=>{curGate=f;document.querySelectorAll('.gate-card').forEach(x=>x.classList.remove('sel'));d.classList.add('sel');document.getElementById('btn-run').disabled=false};box.appendChild(d)})}
+function renderGates(){const box=document.getElementById('gates'),arr=GATES[curType]||[];box.innerHTML='';if(!arr.length){box.innerHTML='<div style="grid-column:1/-1;text-align:center;padding:24px;color:var(--muted);font-size:12px">Nenhum checker em /'+curType+'/</div>';return}arr.forEach(f=>{const nice=f.replace(/\.(php|py)$/i,'');const ext=f.split('.').pop();const d=document.createElement('div');d.className='gate-card';d.innerHTML=`<div class="top"><div class="nm">${nice}</div><div class="ext">${ext}</div></div><div class="tp">${curType==='gate'?'Cartão':'Login'}</div>`;d.onclick=()=>{curGate=f;document.querySelectorAll('.gate-card').forEach(x=>x.classList.remove('sel'));d.classList.add('sel');document.getElementById('btn-run').disabled=false};box.appendChild(d)})}
 
 function showPixMsg(t,type){const m=document.getElementById('pix-msg');m.textContent=t;m.className='notice '+(type==='ok'?'ok':(type==='warn'?'warn':'error'))+' show'}
 
-async function checarPixPermitido(){try{const j=await api({action:'pix_allowed'});const btn=document.getElementById('btn-pix');const msg=document.getElementById('pix-msg');if(j.ok&&!j.allowed){btn.disabled=true;const min=Math.ceil((j.wait||0)/60);if(j.pending&&j.pending.qr){showPixMsg('⏳ PIX pendente. Aguarde pagar ou '+min+' min.',(type='warn'));if(confirm('Abrir PIX pendente?')){document.getElementById('pix-img').src=j.pending.qr;document.getElementById('pix-copy').textContent=j.pending.copy;document.getElementById('pix-sub').textContent='Valor: R$ '+j.pending.amount.toFixed(2).replace('.',',');document.getElementById('pix-modal').classList.add('show');monitorPix(j.pending.txid)}}else showPixMsg('⏳ Aguarde '+min+' min.',(type='warn'))}else{btn.disabled=false;msg.className='notice'}}catch(e){}}
+async function checarPixPermitido(){try{const j=await api({action:'pix_allowed'});const btn=document.getElementById('btn-pix');const msg=document.getElementById('pix-msg');if(j.ok&&!j.allowed){btn.disabled=true;const min=Math.ceil((j.wait||0)/60);if(j.pending&&j.pending.qr){showPixMsg('⏳ PIX pendente. Aguarde pagar ou '+min+' min.','warn');if(confirm('Abrir PIX pendente?')){document.getElementById('pix-img').src=j.pending.qr;document.getElementById('pix-copy').textContent=j.pending.copy;document.getElementById('pix-sub').textContent='Valor: R$ '+j.pending.amount.toFixed(2).replace('.',',');document.getElementById('pix-modal').classList.add('show');monitorPix(j.pending.txid)}}else showPixMsg('⏳ Aguarde '+min+' min.','warn')}else{btn.disabled=false;msg.className='notice'}}catch(e){}}
 
 async function criarPix(){const amt=parseFloat(document.getElementById('dep-amount').value);if(!amt||amt<<?= DEP_MIN ?>||amt><?= DEP_MAX ?>)return showPixMsg('Valor entre <?= fmtMoney(DEP_MIN) ?> e <?= fmtMoney(DEP_MAX) ?>','error');try{const j=await api({action:'deposit',amount:amt});if(!j.ok){showPixMsg(j.error||'Erro','error');return}document.getElementById('pix-img').src=j.qr;document.getElementById('pix-copy').textContent=j.copy;document.getElementById('pix-sub').textContent='Valor: R$ '+j.amount.toFixed(2).replace('.',',');document.getElementById('pix-modal').classList.add('show');document.getElementById('pix-msg').className='notice';monitorPix(j.txid)}catch(e){showPixMsg('Erro conexão','error')}}
 
@@ -1138,94 +1169,4 @@ document.addEventListener('DOMContentLoaded',()=>{renderGates();checarPixPermiti
         <div class="eyebrow">Seu próximo nível começa aqui</div>
         <h1>Trabalho sério.<br><span>Outro nível.</span></h1>
         <p class="lead">Seu espaço, suas ferramentas, sua evolução. Entre na plataforma e continue de onde parou.</p>
-        <div class="feature"><div class="feature-icon"><svg viewBox="0 0 24 24" fill="none"><path d="M12 3l7 3v5c0 4.5-3 7.5-7 10-4-2.5-7-5.5-7-10V6l7-3z" stroke="currentColor" stroke-width="1.7"/><path d="M9 12l2 2 4-4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></div><div><strong>Seu espaço protegido</strong><small>Acesso pessoal em uma interface simples e direta.</small></div></div>
-    </section>
-    <section class="auth-wrap">
-        <div class="auth-card">
-            <div class="card-kicker">Bem-vindo à plataforma</div>
-            <h2 id="formTitle">Que bom ter você.</h2>
-            <p class="sub" id="formSub">Entre com seus dados para acessar sua conta.</p>
-            <div class="tabs" role="tablist">
-                <button class="tab active" type="button" id="loginTab">Entrar</button>
-                <button class="tab" type="button" id="registerTab">Criar conta</button>
-                <button class="tab" type="button" id="adminTab">Admin</button>
-            </div>
-            <div class="notice" id="msg"></div>
-            <form id="authForm" autocomplete="off" onsubmit="return false;">
-                <input type="hidden" name="mode" id="modeInput" value="login">
-                <input type="text" name="website" id="hp_field" tabindex="-1" autocomplete="off" style="position:absolute;left:-9999px;width:1px;height:1px;opacity:0;pointer-events:none" aria-hidden="true">
-                <div class="field"><label for="username">Usuário</label><div class="input-wrap"><svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="8" r="4" stroke="currentColor" stroke-width="1.7"/><path d="M4 20c.8-4 3.5-6 8-6s7.2 2 8 6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg><input id="username" name="username" type="text" autocomplete="username" placeholder="Digite seu usuário" minlength="3" maxlength="20" required></div></div>
-                <div class="field"><label for="password">Senha</label><div class="input-wrap"><svg viewBox="0 0 24 24" fill="none"><rect x="4" y="10" width="16" height="11" rx="2" stroke="currentColor" stroke-width="1.7"/><path d="M8 10V7a4 4 0 018 0v3" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg><input id="password" name="password" type="password" autocomplete="current-password" placeholder="Digite sua senha" minlength="8" required><button class="toggle-pass" type="button" id="togglePass"><svg viewBox="0 0 24 24" fill="none"><path d="M2.5 12s3.3-6 9.5-6 9.5 6 9.5 6-3.3 6-9.5 6-9.5-6-9.5-6z" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="12" r="2.5" stroke="currentColor" stroke-width="1.6"/></svg></button></div></div>
-                <div class="field" id="confirmField" hidden><label for="confirm_password">Confirmar senha</label><div class="input-wrap"><svg viewBox="0 0 24 24" fill="none"><rect x="4" y="10" width="16" height="11" rx="2" stroke="currentColor" stroke-width="1.7"/><path d="M8 10V7a4 4 0 018 0v3" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg><input id="confirm_password" name="confirm_password" type="password" autocomplete="new-password" placeholder="Repita a senha" minlength="8"></div></div>
-                <button class="submit" type="submit" id="submitBtn"><span id="submitText">ACESSAR MINHA CONTA</span><svg viewBox="0 0 24 24" fill="none"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
-            </form>
-            <div class="security"><svg viewBox="0 0 24 24" fill="none"><path d="M12 3l7 3v5c0 4.5-3 7.5-7 10-4-2.5-7-5.5-7-10V6l7-3z" stroke="currentColor" stroke-width="1.7"/><path d="M9 12l2 2 4-4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg> Seus dados são protegidos</div>
-        </div>
-    </section>
-    <footer class="foot"><span>© <?= date('Y') ?> Hipólito CLT</span><span>FEITO PARA IR ALÉM</span></footer>
-</main>
-<script>
-const CSRF = <?= json_encode($csrf) ?>;
-const loginTab = document.getElementById('loginTab'), registerTab = document.getElementById('registerTab'), adminTab = document.getElementById('adminTab');
-const modeInput = document.getElementById('modeInput'), confirmField = document.getElementById('confirmField'), confirmInput = document.getElementById('confirm_password');
-const title = document.getElementById('formTitle'), sub = document.getElementById('formSub'), submitText = document.getElementById('submitText');
-const password = document.getElementById('password'), username = document.getElementById('username'), msg = document.getElementById('msg'), btn = document.getElementById('submitBtn'), hp = document.getElementById('hp_field');
-let currentMode = 'login';
-
-function setMode(mode) {
-    currentMode = mode;
-    const register = mode === 'register';
-    const admin = mode === 'admin';
-    modeInput.value = mode;
-    loginTab.classList.toggle('active', !register && !admin);
-    registerTab.classList.toggle('active', register);
-    adminTab.classList.toggle('active', admin);
-    confirmField.hidden = !register;
-    confirmInput.required = register;
-    title.textContent = register ? 'Crie seu acesso.' : (admin ? 'Acesso administrativo.' : 'Que bom ter você.');
-    sub.textContent = register ? 'Preencha os dados para começar.' : (admin ? 'Entre com suas credenciais de admin.' : 'Entre com seus dados para acessar.');
-    submitText.textContent = register ? 'CRIAR MINHA CONTA' : (admin ? 'ACESSAR PAINEL ADMIN' : 'ACESSAR MINHA CONTA');
-    password.autocomplete = register ? 'new-password' : 'current-password';
-    hideMsg();
-}
-loginTab.onclick = () => setMode('login');
-registerTab.onclick = () => setMode('register');
-adminTab.onclick = () => setMode('admin');
-document.getElementById('togglePass').onclick = () => { password.type = password.type === 'password' ? 'text' : 'password' };
-
-function showMsg(t, type) { msg.textContent = t; msg.className = 'notice ' + (type === 'ok' ? 'ok' : (type === 'warn' ? 'warn' : 'error')) + ' show'; }
-function hideMsg() { msg.className = 'notice'; }
-
-async function api(payload) {
-    const r = await fetch('index.php', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' }, body: JSON.stringify({ ...payload, csrf: CSRF, honeypot: hp.value }), credentials: 'same-origin' });
-    const t = await r.text();
-    try { return JSON.parse(t); } catch (e) { console.error(t); return { ok: false, error: 'Erro servidor' }; }
-}
-
-document.getElementById('authForm').onsubmit = async (e) => {
-    e.preventDefault(); hideMsg();
-    const u = username.value.trim(), p = password.value;
-    if (currentMode === 'admin') {
-        btn.disabled = true; submitText.textContent = 'ENTRANDO...';
-        try {
-            const j = await api({ action: 'admin_login', username: u, password: p });
-            if (j.ok) { showMsg('✅ Admin OK!', 'ok'); setTimeout(() => location.href = j.redirect, 400); }
-            else { showMsg(j.error || 'Erro', 'error'); btn.disabled = false; submitText.textContent = 'ACESSAR PAINEL ADMIN'; }
-        } catch (err) { showMsg('Erro conexão', 'error'); btn.disabled = false; submitText.textContent = 'ACESSAR PAINEL ADMIN'; }
-        return;
-    }
-    if (!u || u.length < 3) return showMsg('Usuário 3+ chars.', 'error');
-    if (!p || p.length < 8) return showMsg('Senha 8+ chars.', 'error');
-    if (currentMode === 'register' && p !== confirmInput.value) return showMsg('Senhas não coincidem.', 'error');
-    btn.disabled = true; submitText.textContent = currentMode === 'register' ? 'CRIANDO...' : 'ENTRANDO...';
-    try {
-        const payload = currentMode === 'register' ? { action: 'register', username: u, password: p, confirm: confirmInput.value } : { action: 'login', username: u, password: p };
-        const j = await api(payload);
-        if (j.ok) { showMsg('✅ OK! Entrando...', 'ok'); setTimeout(() => location.href = j.redirect || 'index.php', 400); }
-        else { showMsg(j.error || 'Erro', 'error'); btn.disabled = false; submitText.textContent = currentMode === 'register' ? 'CRIAR MINHA CONTA' : 'ACESSAR MINHA CONTA'; }
-    } catch (err) { showMsg('Erro conexão', 'error'); btn.disabled = false; submitText.textContent = currentMode === 'register' ? 'CRIAR MINHA CONTA' : 'ACESSAR MINHA CONTA'; }
-};
-</script>
-<?php endif; ?>
-</body>
-</html>
+        <div class="feature"><div class="feature-icon"><svg viewBox="0 0 24 24" fill="none"><path d="M12 3l7 3v5c0 4.5-3 7.5-7 10-4-2.5-7-5.5-7-10V6l7-3z" stroke="currentColor" stroke-width="1.7"/><path d="M9 12l2 2 4-4" stroke="currentColor" stroke-width="1.7" stroke
