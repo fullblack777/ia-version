@@ -52,6 +52,7 @@ define('BOT_TOKEN', '8952767112:AAGsG1yxraZXY0IkZ3QmIGu5_jfTXhhhGas');
 define('ADMIN_TG', 8617449427);
 define('ELITE_ID', 'ep_421737e484563dee4971477ca0c87575');
 define('ELITE_SECRET', 'eps_43f74326495af4ef95c43bf9b501ef122e4410dc6a8eb48d9f19f972509e2945');
+define('ELITE_WEBHOOK_SECRET', 'eps_43f74326495af4ef95c43bf9b501ef122e4410dc6a8eb48d9f19f972509e2945');
 define('ELITE_URL', 'https://api.elitepaybr.com');
 define('BASE_URL', getenv('BASE_URL') ?: 'https://hipolito-ctl.onrender.com');
 
@@ -183,6 +184,14 @@ function userDeductBalance(int $id, float $a): bool {
     return $stmt->execute() !== false;
 }
 
+function userSetBalance(int $id, float $a): void {
+    $db = db();
+    $stmt = $db->prepare('UPDATE users SET balance = :a WHERE id = :i');
+    $stmt->bindValue(':a', max(0, $a), SQLITE3_FLOAT);
+    $stmt->bindValue(':i', $id, SQLITE3_INTEGER);
+    $stmt->execute();
+}
+
 function sessionCreate(int $uid, string $ip, string $ua): string {
     $db = db();
     $t = bin2hex(random_bytes(32));
@@ -270,7 +279,7 @@ function eliteDeposit(float $amount): array {
         CURLOPT_POSTFIELDS     => json_encode([
             'amount' => round($amount, 2),
             'description' => 'Deposito HIPOLITO CLT',
-            'projectWebhook' => BASE_URL . '/webhook.php',
+            'projectWebhook' => BASE_URL . '/index.php?action=webhook',
         ]),
         CURLOPT_HTTPHEADER => [
             'x-client-id: ' . ELITE_ID,
@@ -290,12 +299,39 @@ function eliteDeposit(float $amount): array {
     return ['ok' => true, 'txid' => $d['transactionId'], 'qr' => $d['qrcodeUrl'] ?? '', 'copy' => $d['copyPaste'] ?? ''];
 }
 
+function eliteVerifyWebhookSignature(string $timestamp, string $rawBody, string $signature): bool {
+    $base = $timestamp . '.' . $rawBody;
+    $expected = 'sha256=' . hash_hmac('sha256', $base, ELITE_WEBHOOK_SECRET);
+    return hash_equals($expected, $signature);
+}
+
 function depositByTxid(string $txid): ?array {
     $db = db();
     $stmt = $db->prepare('SELECT * FROM deposits WHERE transaction_id = :t');
     $stmt->bindValue(':t', $txid, SQLITE3_TEXT);
     $r = $stmt->execute()->fetchArray(SQLITE3_ASSOC);
     return $r ?: null;
+}
+
+function depositConfirm(string $txid, ?float $net = null, ?string $payerName = null, ?string $payerDoc = null): bool {
+    $db = db();
+    $d = depositByTxid($txid);
+    if (!$d || $d['status'] === 'paid') return false;
+    $db->exec('BEGIN IMMEDIATE');
+    try {
+        $stmt = $db->prepare('UPDATE deposits SET status = "paid", paid_at = CURRENT_TIMESTAMP, net_amount = :n, payer_name = :pn, payer_document = :pd WHERE transaction_id = :t');
+        $stmt->bindValue(':n', $net ?? $d['amount'], SQLITE3_FLOAT);
+        $stmt->bindValue(':pn', $payerName, SQLITE3_TEXT);
+        $stmt->bindValue(':pd', $payerDoc, SQLITE3_TEXT);
+        $stmt->bindValue(':t', $txid, SQLITE3_TEXT);
+        $stmt->execute();
+        userAddBalance((int)$d['user_id'], (float)($net ?? $d['amount']));
+        $db->exec('COMMIT');
+        return true;
+    } catch (Throwable $e) {
+        $db->exec('ROLLBACK');
+        return false;
+    }
 }
 
 function depositPendente(int $userId): ?array {
@@ -347,13 +383,106 @@ function listGates(): array {
     return $g;
 }
 
+function statsGlobal(): array {
+    $db = db();
+    $r = [];
+    $r['users'] = (int)$db->querySingle('SELECT COUNT(*) FROM users');
+    $r['deposits_total'] = (float)$db->querySingle('SELECT COALESCE(SUM(net_amount), 0) FROM deposits WHERE status = "paid"');
+    $r['deposits_count'] = (int)$db->querySingle('SELECT COUNT(*) FROM deposits WHERE status = "paid"');
+    $r['checks_total'] = (int)$db->querySingle('SELECT COUNT(*) FROM checks');
+    $r['lives_total'] = (int)$db->querySingle('SELECT COUNT(*) FROM checks WHERE result = "live"');
+    $r['dies_total'] = (int)$db->querySingle('SELECT COUNT(*) FROM checks WHERE result = "die"');
+    $r['deposits_pending'] = (int)$db->querySingle('SELECT COUNT(*) FROM deposits WHERE status = "pending"');
+    return $r;
+}
+
+function listAllUsers(): array {
+    $db = db();
+    $r = $db->query('SELECT * FROM users ORDER BY id DESC');
+    $out = [];
+    while ($row = $r->fetchArray(SQLITE3_ASSOC)) $out[] = $row;
+    return $out;
+}
+
+function listRecentDeposits(int $limit = 50): array {
+    $db = db();
+    $stmt = $db->prepare('SELECT d.*, u.username FROM deposits d LEFT JOIN users u ON u.id = d.user_id ORDER BY d.id DESC LIMIT :l');
+    $stmt->bindValue(':l', $limit, SQLITE3_INTEGER);
+    $r = $stmt->execute();
+    $out = [];
+    while ($row = $r->fetchArray(SQLITE3_ASSOC)) $out[] = $row;
+    return $out;
+}
+
+function listRecentChecks(int $limit = 100): array {
+    $db = db();
+    $stmt = $db->prepare('SELECT c.*, u.username FROM checks c LEFT JOIN users u ON u.id = c.user_id ORDER BY c.id DESC LIMIT :l');
+    $stmt->bindValue(':l', $limit, SQLITE3_INTEGER);
+    $r = $stmt->execute();
+    $out = [];
+    while ($row = $r->fetchArray(SQLITE3_ASSOC)) $out[] = $row;
+    return $out;
+}
+
+function listAudit(int $limit = 100): array {
+    $db = db();
+    $stmt = $db->prepare('SELECT * FROM audit_log ORDER BY id DESC LIMIT :l');
+    $stmt->bindValue(':l', $limit, SQLITE3_INTEGER);
+    $r = $stmt->execute();
+    $out = [];
+    while ($row = $r->fetchArray(SQLITE3_ASSOC)) $out[] = $row;
+    return $out;
+}
+
 $ip = clientIp();
 
-if (isset($_GET['ping'])) { header('Content-Type: text/plain'); echo 'OK:' . time(); exit; }
+if (isset($_GET['action']) && $_GET['action'] === 'ping') { header('Content-Type: text/plain'); echo 'OK:' . time(); exit; }
+
+if (isset($_GET['action']) && $_GET['action'] === 'webhook') {
+    $rawBody = file_get_contents('php://input');
+    $ts = $_SERVER['HTTP_X_ELITE_TIMESTAMP'] ?? '';
+    $sig = $_SERVER['HTTP_X_ELITE_SIGNATURE'] ?? '';
+    if (!$rawBody || !$ts || !$sig) { http_response_code(400); echo 'bad request'; exit; }
+    if (!eliteVerifyWebhookSignature($ts, $rawBody, $sig)) { http_response_code(401); echo 'invalid signature'; exit; }
+    $payload = json_decode($rawBody, true);
+    if (!is_array($payload)) { http_response_code(400); echo 'invalid json'; exit; }
+    $txid = $payload['transactionId'] ?? $payload['acquirerTransactionId'] ?? '';
+    $state = $payload['transactionState'] ?? '';
+    $status = $payload['status'] ?? '';
+    $netValue = (float)($payload['netValue'] ?? $payload['value'] ?? 0);
+    $payerName = $payload['payer']['name'] ?? ($payload['payerName'] ?? '');
+    $payerDoc = $payload['payer']['document'] ?? ($payload['payerDocument'] ?? '');
+    if (!$txid) { http_response_code(200); echo 'no txid'; exit; }
+    $d = depositByTxid($txid);
+    if (!$d) { auditLog(null, null, 'webhook_orphan', "txid=$txid state=$state", $ip); http_response_code(200); echo 'ok'; exit; }
+    if ($d['status'] === 'paid') { http_response_code(200); echo 'already paid'; exit; }
+    $isComplete = in_array($state, ['COMPLETO'], true) || in_array($status, ['aprovado', 'concluido'], true);
+    $isFailed = in_array($state, ['FALHA', 'RECUSADO', 'CANCELADO', 'DEVOLVIDO', 'REEMBOLSADO', 'ESTORNO'], true);
+    if ($isComplete) {
+        $net = $netValue > 0 ? $netValue : (float)$d['amount'];
+        $ok = depositConfirm($txid, $net, $payerName, $payerDoc);
+        if ($ok) {
+            $u = userById((int)$d['user_id']);
+            tg("💰 <b>DEPÓSITO CONFIRMADO</b>\n\n👤 <b>" . ($u['username'] ?? 'N/A') . "</b>\n🆔 <code>{$d['user_id']}</code>\n💵 " . fmtMoney($net) . "\n📱 <code>" . ($d['ip'] ?? 'N/A') . "</code>\n🔑 <code>" . substr($txid, 0, 20) . "...</code>\n💳 Novo saldo: <b>" . fmtMoney((float)($u['balance'] ?? 0)) . "</b>\n⚡ " . BRAND);
+            auditLog((int)$d['user_id'], $u['username'] ?? null, 'deposit_paid', "amount=$net txid=$txid", $ip);
+        }
+    } elseif ($isFailed) {
+        $db = db();
+        $stmt = $db->prepare('UPDATE deposits SET status = :s WHERE transaction_id = :t');
+        $stmt->bindValue(':s', strtolower($state), SQLITE3_TEXT);
+        $stmt->bindValue(':t', $txid, SQLITE3_TEXT);
+        $stmt->execute();
+        auditLog((int)$d['user_id'], null, 'deposit_failed', "state=$state txid=$txid", $ip);
+    }
+    http_response_code(200);
+    echo 'ok';
+    exit;
+}
 
 if (isset($_GET['logout'])) {
     if (!empty($_COOKIE['hipctl_token'])) sessionDestroy($_COOKIE['hipctl_token']);
     setcookie('hipctl_token', '', time() - 3600, '/', '', isset($_SERVER['HTTPS']), true);
+    $_SESSION = [];
     session_destroy();
     header('Location: index.php'); exit;
 }
@@ -369,6 +498,58 @@ try {
         if (!is_array($json)) $json = $_POST;
         $action = $json['action'] ?? '';
         if ($action === '') jsonOut(['ok' => false, 'error' => 'Ação vazia'], 400);
+
+        if (in_array($action, ['admin_login', 'admin_action'], true)) {
+            if ($action === 'admin_login') {
+                if (!rateCheck('admin_login', $ip, 10, 900)) jsonOut(['ok' => false, 'error' => 'Muitas tentativas'], 429);
+                $u = trim($json['username'] ?? '');
+                $p = $json['password'] ?? '';
+                if ($u === ADMIN_USER && hash_equals(ADMIN_PASS, $p)) {
+                    session_regenerate_id(true);
+                    $_SESSION['admin'] = true;
+                    auditLog(null, 'admin', 'admin_login', "ip=$ip", $ip);
+                    jsonOut(['ok' => true, 'redirect' => 'index.php?admin=1']);
+                }
+                auditLog(null, $u, 'admin_login_fail', "ip=$ip", $ip);
+                jsonOut(['ok' => false, 'error' => 'Credenciais inválidas']);
+            }
+            if (empty($_SESSION['admin'])) jsonOut(['ok' => false, 'error' => 'Não autorizado'], 401);
+            if (!csrfOk($json['csrf'] ?? '')) jsonOut(['ok' => false, 'error' => 'CSRF inválido'], 403);
+
+            if ($action === 'admin_action') {
+                $sub = $json['sub'] ?? '';
+                if ($sub === 'add_balance') {
+                    $uid = (int)($json['user_id'] ?? 0); $amount = (float)($json['amount'] ?? 0);
+                    if ($uid <= 0 || $amount <= 0) jsonOut(['ok' => false, 'error' => 'Dados inválidos']);
+                    $u = userById($uid); if (!$u) jsonOut(['ok' => false, 'error' => 'Usuário não encontrado']);
+                    $nb = userAddBalance($uid, $amount);
+                    auditLog($uid, $u['username'], 'admin_add_balance', "amount=$amount new=$nb", $ip);
+                    tg("💰 <b>ADMIN +SALDO</b>\n\n👤 <b>{$u['username']}</b>\n💵 +" . fmtMoney($amount) . "\n💳 Novo: " . fmtMoney($nb) . "\n⚡ " . BRAND);
+                    jsonOut(['ok' => true, 'balance' => $nb]);
+                }
+                if ($sub === 'rem_balance') {
+                    $uid = (int)($json['user_id'] ?? 0); $amount = (float)($json['amount'] ?? 0);
+                    if ($uid <= 0 || $amount <= 0) jsonOut(['ok' => false, 'error' => 'Dados inválidos']);
+                    $u = userById($uid); if (!$u) jsonOut(['ok' => false, 'error' => 'Usuário não encontrado']);
+                    $nb = max(0, (float)$u['balance'] - $amount);
+                    userSetBalance($uid, $nb);
+                    auditLog($uid, $u['username'], 'admin_rem_balance', "amount=$amount new=$nb", $ip);
+                    jsonOut(['ok' => true, 'balance' => $nb]);
+                }
+                if ($sub === 'delete_user') {
+                    $uid = (int)($json['user_id'] ?? 0);
+                    if ($uid <= 0) jsonOut(['ok' => false, 'error' => 'ID inválido']);
+                    $u = userById($uid); if (!$u) jsonOut(['ok' => false, 'error' => 'Usuário não encontrado']);
+                    $db = db();
+                    $stmt = $db->prepare('DELETE FROM users WHERE id = :i');
+                    $stmt->bindValue(':i', $uid, SQLITE3_INTEGER);
+                    $stmt->execute();
+                    auditLog(null, 'admin', 'admin_delete_user', "user={$u['username']} id=$uid", $ip);
+                    jsonOut(['ok' => true]);
+                }
+            }
+        }
+
         if (!csrfOk($json['csrf'] ?? '')) jsonOut(['ok' => false, 'error' => 'Sessão expirada. Recarregue a página.'], 403);
 
         if ($action === 'register') {
@@ -526,13 +707,23 @@ try {
     jsonOut(['ok' => false, 'error' => 'Erro servidor'], 500);
 }
 
+if (isset($_GET['admin']) && !empty($_SESSION['admin'])) {
+    $csrf = csrf();
+    $stats = statsGlobal();
+    $users = listAllUsers();
+    $deposits = listRecentDeposits(50);
+    $checks = listRecentChecks(100);
+    $audit = listAudit(100);
+    $adminMode = true;
+} else {
+    $adminMode = false;
+}
+
 $user = getSessionUser();
 $csrf = csrf();
 $gates = listGates();
-$mode = 'login';
 $pixData = null;
 if ($user) {
-    $r = canCreatePix((int)$user['id']);
     $pend = depositPendente((int)$user['id']);
     if ($pend) $pixData = ['txid' => $pend['transaction_id'], 'qr' => $pend['qrcode_url'], 'copy' => $pend['copy_paste'], 'amount' => (float)$pend['amount'], 'created_at' => $pend['created_at']];
 }
@@ -543,9 +734,9 @@ if ($user) {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="theme-color" content="#0a0c0b">
-<title><?= SITE_NAME ?> — Acesso</title>
+<title><?= SITE_NAME ?> <?= $adminMode ? '— Admin' : '— Acesso' ?></title>
 <style>
-:root{--bg:#090b0a;--panel:rgba(18,22,19,.88);--line:rgba(255,255,255,.10);--muted:#8e9990;--text:#f3f7f2;--lime:#c8ff52;--lime2:#9fe62d;--red:#ff5f5f}
+:root{--bg:#090b0a;--line:rgba(255,255,255,.10);--muted:#8e9990;--text:#f3f7f2;--lime:#c8ff52;--lime2:#9fe62d;--red:#ff5f5f;--cyan:#00d4ff;--yellow:#fbbf24;--purple:#a78bfa}
 *{box-sizing:border-box}
 html{min-height:100%;background:var(--bg)}
 body{margin:0;min-height:100vh;color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:radial-gradient(ellipse at 13% 12%,rgba(137,197,55,.12),transparent 34%),radial-gradient(ellipse at 89% 86%,rgba(78,126,61,.12),transparent 30%),var(--bg);overflow-x:hidden}
@@ -561,7 +752,6 @@ body:before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.18;ba
 h1{font-size:clamp(46px,6.4vw,88px);line-height:.96;letter-spacing:-.075em;margin:0;font-weight:850}h1 span{color:var(--lime)}
 .lead{color:#9ba59c;font-size:15px;line-height:1.8;max-width:390px;margin:26px 0 38px}
 .feature{display:flex;align-items:center;gap:15px;margin-top:10px}.feature-icon{width:42px;height:42px;border:1px solid #c8ff5238;border-radius:13px;display:grid;place-items:center;color:var(--lime);background:#c8ff520a}.feature-icon svg{width:19px;height:19px}.feature strong{font-size:12px;display:block;margin-bottom:4px}.feature small{font-size:11px;color:var(--muted)}
-.visual{position:relative;margin-top:35px;width:min(100%,430px);height:145px;border:1px solid var(--line);border-radius:18px;overflow:hidden;background:linear-gradient(120deg,#ffffff06,#ffffff01);display:flex;align-items:center;padding:22px 25px;gap:18px}.visual:after{content:"";position:absolute;width:200px;height:200px;border:1px solid #c8ff521c;border-radius:50%;right:-30px;top:-95px;box-shadow:0 0 0 24px #c8ff5207,0 0 0 48px #c8ff5205}.visual-number{font-size:42px;letter-spacing:-.08em;font-weight:800;color:var(--lime)}.visual-copy{font-size:11px;line-height:1.7;color:#a5aea5;max-width:135px}
 .auth-wrap{display:flex;align-items:center;justify-content:center;padding:90px 0 35px}
 .auth-card{width:100%;max-width:430px;padding:clamp(25px,4vw,40px);background:linear-gradient(145deg,rgba(25,30,26,.94),rgba(13,16,14,.96));border:1px solid rgba(255,255,255,.11);border-radius:25px;box-shadow:0 30px 100px #0007, inset 0 1px #ffffff0a;position:relative;overflow:hidden}
 .auth-card:before{content:"";position:absolute;left:35px;right:35px;top:0;height:1px;background:linear-gradient(90deg,transparent,var(--lime),transparent);opacity:.8}
@@ -648,186 +838,198 @@ textarea.lista:focus{border-color:var(--lime);box-shadow:0 0 0 3px #c8ff5215}
 @keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.4;transform:scale(.85)}}
 .pix-timer{margin-top:10px;text-align:center;font-size:11px;color:var(--muted);font-family:'Courier New',monospace}
 
-@media(max-width:900px){.shell{grid-template-columns:1fr;max-width:600px;padding:24px 22px}.topbar{position:relative;left:auto;right:auto;top:auto;grid-row:1}.intro{padding:65px 0 15px;max-width:none}.intro h1{font-size:clamp(45px,10vw,70px)}.lead{margin:18px 0 22px}.feature{display:none}.visual{display:none}.auth-wrap{padding:20px 0 75px}.auth-card{max-width:480px}.foot{left:22px;right:22px;bottom:16px}.status{font-size:9px}.dash-nav{padding:12px 20px}.dash-wrap{padding:16px 20px}}
-@media(max-width:420px){.shell{padding:19px 15px}.brand{font-size:15px}.brand-mark{width:34px;height:34px}.status{padding:8px;font-size:8px}.intro{padding-top:48px}.auth-card{padding:24px 19px;border-radius:20px}h2{font-size:27px}.foot{left:15px;right:15px;font-size:9px}.results{grid-template-columns:1fr}}
+/* ===== ADMIN ===== */
+.admin-wrap{max-width:1400px;margin:0 auto;padding:24px}
+.admin-top{display:flex;align-items:center;justify-content:space-between;padding:16px 24px;margin-bottom:24px;background:rgba(20,25,22,.85);border:1px solid var(--line);border-radius:16px;flex-wrap:wrap;gap:12px}
+.admin-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:20px}
+.admin-stat{background:rgba(20,25,22,.85);border:1px solid var(--line);border-radius:14px;padding:18px;position:relative}
+.admin-stat .lbl{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;font-weight:600}
+.admin-stat .val{font-size:22px;font-weight:800;font-family:'Courier New',monospace}
+.admin-tabs{display:flex;gap:6px;margin-bottom:20px;background:#080a09;border-radius:12px;padding:5px;border:1px solid var(--line);flex-wrap:wrap}
+.admin-tab{padding:9px 16px;background:none;border:none;color:var(--muted);font-size:12px;font-weight:700;cursor:pointer;border-radius:9px;transition:.2s;text-transform:uppercase;letter-spacing:.8px;font-family:inherit}
+.admin-tab.active{background:var(--lime);color:#000}
+.admin-content{display:none}
+.admin-content.active{display:block}
+.table-wrap{overflow-x:auto;border-radius:12px;border:1px solid rgba(255,255,255,.05);background:rgba(20,25,22,.7)}
+table.tbl{width:100%;border-collapse:collapse;font-size:12px}
+table.tbl th{padding:11px 12px;text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);background:rgba(0,0,0,.3);border-bottom:1px solid var(--line);font-weight:700;white-space:nowrap}
+table.tbl td{padding:11px 12px;border-bottom:1px solid rgba(255,255,255,.04);vertical-align:middle}
+table.tbl tr:hover td{background:rgba(200,255,82,.02)}
+.badge{display:inline-block;padding:3px 9px;border-radius:20px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.5px}
+.b-green{background:rgba(200,255,82,.12);color:var(--lime);border:1px solid rgba(200,255,82,.25)}
+.b-red{background:rgba(255,95,95,.12);color:#ffb0a9;border:1px solid rgba(255,95,95,.25)}
+.b-yellow{background:rgba(251,191,36,.12);color:var(--yellow);border:1px solid rgba(251,191,36,.25)}
+.b-cyan{background:rgba(0,212,255,.12);color:var(--cyan);border:1px solid rgba(0,212,255,.25)}
+.act-form{display:flex;gap:4px;align-items:center;flex-wrap:wrap}
+.act-form input{width:70px;padding:6px 8px;background:rgba(0,0,0,.5);border:1px solid var(--line);border-radius:7px;color:var(--text);font-size:11px;outline:none;font-family:inherit}
+.btn-sm{padding:6px 10px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.12);border-radius:7px;color:var(--text);font-size:11px;font-weight:700;cursor:pointer;transition:.2s;font-family:inherit}
+.btn-sm.green{color:var(--lime);border-color:rgba(200,255,82,.3)}
+.btn-sm.red{color:#ffb0a9;border-color:rgba(255,95,95,.3)}
+.empty{text-align:center;padding:40px;color:var(--muted);font-size:13px}
+code{font-family:'Courier New',monospace;background:rgba(0,0,0,.4);padding:2px 7px;border-radius:5px;font-size:11px}
+
+@media(max-width:900px){.shell{grid-template-columns:1fr;max-width:600px;padding:24px 22px}.topbar{position:relative;left:auto;right:auto;top:auto}.intro{padding:65px 0 15px;max-width:none}.lead{margin:18px 0 22px}.feature,.visual{display:none}.auth-wrap{padding:20px 0 75px}.auth-card{max-width:480px}.foot{left:22px;right:22px;bottom:16px}.dash-nav{padding:12px 20px}.dash-wrap{padding:16px 20px}.results{grid-template-columns:1fr}.admin-wrap{padding:16px}}
+@media(max-width:420px){.shell{padding:19px 15px}.brand{font-size:15px}.auth-card{padding:24px 19px}h2{font-size:27px}}
 @media(prefers-reduced-motion:reduce){*,*:before,*:after{animation:none!important;transition:none!important}}
 </style>
 </head>
 <body>
-<?php if (!$user): ?>
+<?php if ($adminMode): ?>
 <div class="orb"></div><div class="orb two"></div>
-<main class="shell">
-  <header class="topbar">
-    <div class="brand">
-      <div class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M5 18V6l7 8 7-8v12M5 6h14" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
-      HIPÓLITO <span style="color:var(--lime)">CLT</span>
-    </div>
-    <div class="status"><i></i> Portal de acesso</div>
-  </header>
-
-  <section class="intro">
-    <div class="eyebrow">Seu próximo nível começa aqui</div>
-    <h1>Trabalho sério.<br><span>Outro nível.</span></h1>
-    <p class="lead">Seu espaço, suas ferramentas, sua evolução. Entre na plataforma e continue de onde parou.</p>
-    <div class="feature">
-      <div class="feature-icon"><svg viewBox="0 0 24 24" fill="none"><path d="M12 3l7 3v5c0 4.5-3 7.5-7 10-4-2.5-7-5.5-7-10V6l7-3z" stroke="currentColor" stroke-width="1.7"/><path d="M9 12l2 2 4-4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
-      <div><strong>Seu espaço protegido</strong><small>Acesso pessoal em uma interface simples e direta.</small></div>
-    </div>
-    <div class="visual">
-      <div class="visual-number">01<span style="font-size:20px">/</span>∞</div>
-      <div class="visual-copy">Foco no que importa.<br>Sem complicação.<br>Do seu jeito.</div>
-    </div>
-  </section>
-
-  <section class="auth-wrap">
-    <div class="auth-card">
-      <div class="card-kicker">Bem-vindo à plataforma</div>
-      <h2 id="formTitle">Que bom ter você.</h2>
-      <p class="sub" id="formSub">Entre com seus dados para acessar sua conta.</p>
-
-      <div class="tabs" role="tablist">
-        <button class="tab active" type="button" id="loginTab">Entrar</button>
-        <button class="tab" type="button" id="registerTab">Criar conta</button>
-      </div>
-
-      <div class="notice" id="msg"></div>
-
-      <form id="authForm" autocomplete="off" onsubmit="return false;">
-        <input type="hidden" name="mode" id="modeInput" value="login">
-        <input type="text" name="website" id="hp_field" tabindex="-1" autocomplete="off" style="position:absolute;left:-9999px;width:1px;height:1px;opacity:0;pointer-events:none" aria-hidden="true">
-        <div class="field">
-          <label for="username">Usuário</label>
-          <div class="input-wrap">
-            <svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="8" r="4" stroke="currentColor" stroke-width="1.7"/><path d="M4 20c.8-4 3.5-6 8-6s7.2 2 8 6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
-            <input id="username" name="username" type="text" autocomplete="username" placeholder="Digite seu usuário" minlength="3" maxlength="20" required>
-          </div>
+<div class="admin-wrap">
+    <div class="admin-top">
+        <div class="brand">
+            <div class="brand-mark">⚡</div>
+            <div><b style="font-size:15px;">ADMIN PANEL</b><div style="font-size:10px;color:var(--muted);letter-spacing:1px;text-transform:uppercase"><?= SITE_NAME ?></div></div>
         </div>
-        <div class="field">
-          <label for="password">Senha</label>
-          <div class="input-wrap">
-            <svg viewBox="0 0 24 24" fill="none"><rect x="4" y="10" width="16" height="11" rx="2" stroke="currentColor" stroke-width="1.7"/><path d="M8 10V7a4 4 0 018 0v3" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
-            <input id="password" name="password" type="password" autocomplete="current-password" placeholder="Digite sua senha" minlength="8" required>
-            <button class="toggle-pass" type="button" id="togglePass" aria-label="Mostrar senha"><svg viewBox="0 0 24 24" fill="none"><path d="M2.5 12s3.3-6 9.5-6 9.5 6 9.5 6-3.3 6-9.5 6-9.5-6-9.5-6z" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="12" r="2.5" stroke="currentColor" stroke-width="1.6"/></svg></button>
-          </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <a href="index.php" style="padding:9px 14px;background:rgba(200,255,82,.1);border:1px solid rgba(200,255,82,.3);border-radius:10px;color:var(--lime);font-size:11px;font-weight:700;text-decoration:none;text-transform:uppercase;letter-spacing:.5px">↩ Voltar</a>
+            <a href="?logout" class="btn-out">Sair</a>
         </div>
-        <div class="field" id="confirmField" hidden>
-          <label for="confirm_password">Confirmar senha</label>
-          <div class="input-wrap">
-            <svg viewBox="0 0 24 24" fill="none"><rect x="4" y="10" width="16" height="11" rx="2" stroke="currentColor" stroke-width="1.7"/><path d="M8 10V7a4 4 0 018 0v3" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
-            <input id="confirm_password" name="confirm_password" type="password" autocomplete="new-password" placeholder="Digite a senha novamente" minlength="8">
-          </div>
-        </div>
-        <div class="rowline" id="rowline">
-          <label class="remember"><input type="checkbox" id="remember"> Manter conectado</label>
-          <a class="text-link" href="#" id="forgotLink">Esqueci minha senha</a>
-        </div>
-        <button class="submit" type="submit" id="submitBtn"><span id="submitText">ACESSAR MINHA CONTA</span><svg viewBox="0 0 24 24" fill="none"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
-      </form>
-      <div class="security"><svg viewBox="0 0 24 24" fill="none"><path d="M12 3l7 3v5c0 4.5-3 7.5-7 10-4-2.5-7-5.5-7-10V6l7-3z" stroke="currentColor" stroke-width="1.7"/><path d="M9 12l2 2 4-4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg> Seus dados devem ser tratados com segurança</div>
     </div>
-  </section>
 
-  <footer class="foot"><span>© <?= date('Y') ?> Hipólito CLT</span><span>FEITO PARA IR ALÉM</span></footer>
-</main>
+    <div class="admin-stats">
+        <div class="admin-stat"><div class="lbl">Usuários</div><div class="val" style="color:var(--lime)"><?= $stats['users'] ?></div></div>
+        <div class="admin-stat"><div class="lbl">Total Depositado</div><div class="val" style="color:var(--yellow);font-size:18px"><?= fmtMoney($stats['deposits_total']) ?></div></div>
+        <div class="admin-stat"><div class="lbl">Depósitos</div><div class="val" style="color:var(--cyan)"><?= $stats['deposits_count'] ?></div></div>
+        <div class="admin-stat"><div class="lbl">Pendentes</div><div class="val" style="color:var(--yellow)"><?= $stats['deposits_pending'] ?></div></div>
+        <div class="admin-stat"><div class="lbl">Checks</div><div class="val" style="color:var(--purple)"><?= $stats['checks_total'] ?></div></div>
+        <div class="admin-stat"><div class="lbl">Lives</div><div class="val" style="color:var(--lime)"><?= $stats['lives_total'] ?></div></div>
+        <div class="admin-stat"><div class="lbl">Dies</div><div class="val" style="color:#ffb0a9"><?= $stats['dies_total'] ?></div></div>
+    </div>
+
+    <div class="admin-tabs">
+        <button class="admin-tab active" onclick="showAdminTab('users',this)">👥 Usuários</button>
+        <button class="admin-tab" onclick="showAdminTab('deposits',this)">💰 Depósitos</button>
+        <button class="admin-tab" onclick="showAdminTab('checks',this)">🔍 Checks</button>
+        <button class="admin-tab" onclick="showAdminTab('audit',this)">📋 Logs</button>
+    </div>
+
+    <div class="admin-content active" id="ac-users">
+        <div class="table-wrap">
+            <table class="tbl">
+                <thead><tr><th>ID</th><th>Username</th><th>Saldo</th><th>Depositou</th><th>Checks</th><th>Lives</th><th>IP</th><th>Criado</th><th>Ações</th></tr></thead>
+                <tbody>
+                <?php if (empty($users)): ?>
+                <tr><td colspan="9" class="empty">Nenhum usuário</td></tr>
+                <?php else: foreach ($users as $u): ?>
+                <tr>
+                    <td><code>#<?= (int)$u['id'] ?></code></td>
+                    <td><strong><?= esc($u['username']) ?></strong></td>
+                    <td><span style="color:var(--lime);font-weight:700"><?= fmtMoney((float)$u['balance']) ?></span></td>
+                    <td><span style="color:var(--yellow)"><?= fmtMoney((float)$u['total_deposited']) ?></span></td>
+                    <td><?= (int)$u['total_checks'] ?></td>
+                    <td><span class="badge b-green"><?= (int)$u['total_lives'] ?></span></td>
+                    <td><code style="font-size:10px"><?= esc($u['ip'] ?? 'N/A') ?></code></td>
+                    <td style="font-size:11px;color:var(--muted)"><?= date('d/m/y H:i', strtotime($u['created_at'])) ?></td>
+                    <td>
+                        <div class="act-form">
+                            <input type="number" step="0.01" placeholder="R$" id="add-<?= (int)$u['id'] ?>">
+                            <button class="btn-sm green" onclick="adminBalance('add',<?= (int)$u['id'] ?>)">+</button>
+                            <button class="btn-sm red" onclick="adminBalance('rem',<?= (int)$u['id'] ?>)">-</button>
+                            <button class="btn-sm red" onclick="adminDelUser(<?= (int)$u['id'] ?>,'<?= esc($u['username']) ?>')">🗑</button>
+                        </div>
+                    </td>
+                </tr>
+                <?php endforeach; endif; ?>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <div class="admin-content" id="ac-deposits">
+        <div class="table-wrap">
+            <table class="tbl">
+                <thead><tr><th>ID</th><th>User</th><th>Valor</th><th>Líquido</th><th>Status</th><th>Payer</th><th>IP</th><th>TXID</th><th>Data</th></tr></thead>
+                <tbody>
+                <?php if (empty($deposits)): ?>
+                <tr><td colspan="9" class="empty">Nenhum depósito</td></tr>
+                <?php else: foreach ($deposits as $d): ?>
+                <?php $st = $d['status']; $bc = $st==='paid'?'b-green':($st==='pending'?'b-yellow':'b-red'); ?>
+                <tr>
+                    <td><code>#<?= (int)$d['id'] ?></code></td>
+                    <td><strong><?= esc($d['username'] ?? 'N/A') ?></strong></td>
+                    <td><span style="color:var(--yellow)"><?= fmtMoney((float)$d['amount']) ?></span></td>
+                    <td><span style="color:var(--lime)"><?= $d['net_amount'] ? fmtMoney((float)$d['net_amount']) : '—' ?></span></td>
+                    <td><span class="badge <?= $bc ?>"><?= esc($st) ?></span></td>
+                    <td style="font-size:11px"><?= esc($d['payer_name'] ?? '—') ?></td>
+                    <td><code style="font-size:10px"><?= esc($d['ip'] ?? 'N/A') ?></code></td>
+                    <td><code style="font-size:10px"><?= esc(substr($d['transaction_id'] ?? '', 0, 12)) ?>...</code></td>
+                    <td style="font-size:11px;color:var(--muted)"><?= date('d/m/y H:i', strtotime($d['created_at'])) ?></td>
+                </tr>
+                <?php endforeach; endif; ?>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <div class="admin-content" id="ac-checks">
+        <div class="table-wrap">
+            <table class="tbl">
+                <thead><tr><th>ID</th><th>User</th><th>Gate</th><th>Tipo</th><th>Cartão</th><th>Result</th><th>Custo</th><th>IP</th><th>Data</th></tr></thead>
+                <tbody>
+                <?php if (empty($checks)): ?>
+                <tr><td colspan="9" class="empty">Nenhum check</td></tr>
+                <?php else: foreach ($checks as $c): ?>
+                <tr>
+                    <td><code>#<?= (int)$c['id'] ?></code></td>
+                    <td><strong><?= esc($c['username'] ?? 'N/A') ?></strong></td>
+                    <td><code><?= esc($c['gate']) ?></code></td>
+                    <td><span class="badge <?= $c['gate_type']==='gate'?'b-cyan':'b-green' ?>"><?= esc($c['gate_type']) ?></span></td>
+                    <td><code style="font-size:10px"><?= esc(substr($c['card'] ?? '', 0, 6)) ?>***<?= esc(substr($c['card'] ?? '', -4)) ?></code></td>
+                    <td><span class="badge <?= $c['result']==='live'?'b-green':'b-red' ?>"><?= esc($c['result']) ?></span></td>
+                    <td><span style="color:var(--yellow);font-weight:700"><?= fmtMoney((float)$c['cost']) ?></span></td>
+                    <td><code style="font-size:10px"><?= esc($c['ip'] ?? 'N/A') ?></code></td>
+                    <td style="font-size:11px;color:var(--muted)"><?= date('d/m/y H:i', strtotime($c['created_at'])) ?></td>
+                </tr>
+                <?php endforeach; endif; ?>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <div class="admin-content" id="ac-audit">
+        <div class="table-wrap">
+            <table class="tbl">
+                <thead><tr><th>ID</th><th>User</th><th>Ação</th><th>Detalhes</th><th>IP</th><th>Data</th></tr></thead>
+                <tbody>
+                <?php if (empty($audit)): ?>
+                <tr><td colspan="6" class="empty">Nenhum log</td></tr>
+                <?php else: foreach ($audit as $a): ?>
+                <tr>
+                    <td><code>#<?= (int)$a['id'] ?></code></td>
+                    <td><strong><?= esc($a['username'] ?? 'sistema') ?></strong></td>
+                    <td><code style="font-size:10px;color:var(--cyan)"><?= esc($a['action']) ?></code></td>
+                    <td style="font-size:11px;color:var(--muted);max-width:300px;word-break:break-word"><?= esc($a['details'] ?? '') ?></td>
+                    <td><code style="font-size:10px"><?= esc($a['ip'] ?? 'N/A') ?></code></td>
+                    <td style="font-size:11px;color:var(--muted)"><?= date('d/m/y H:i:s', strtotime($a['created_at'])) ?></td>
+                </tr>
+                <?php endforeach; endif; ?>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
 <script>
 const CSRF = <?= json_encode($csrf) ?>;
-const loginTab = document.getElementById('loginTab');
-const registerTab = document.getElementById('registerTab');
-const modeInput = document.getElementById('modeInput');
-const confirmField = document.getElementById('confirmField');
-const confirmInput = document.getElementById('confirm_password');
-const rowline = document.getElementById('rowline');
-const title = document.getElementById('formTitle');
-const sub = document.getElementById('formSub');
-const submitText = document.getElementById('submitText');
-const password = document.getElementById('password');
-const username = document.getElementById('username');
-const msg = document.getElementById('msg');
-const btn = document.getElementById('submitBtn');
-const hp = document.getElementById('hp_field');
-
-function setMode(mode) {
-  const register = mode === 'register';
-  modeInput.value = mode;
-  loginTab.classList.toggle('active', !register);
-  registerTab.classList.toggle('active', register);
-  confirmField.hidden = !register;
-  confirmInput.required = register;
-  rowline.hidden = register;
-  title.textContent = register ? 'Crie seu acesso.' : 'Que bom ter você.';
-  sub.textContent = register ? 'Preencha os dados abaixo para começar.' : 'Entre com seus dados para acessar sua conta.';
-  submitText.textContent = register ? 'CRIAR MINHA CONTA' : 'ACESSAR MINHA CONTA';
-  password.autocomplete = register ? 'new-password' : 'current-password';
-  hideMsg();
-}
-loginTab.onclick = () => setMode('login');
-registerTab.onclick = () => setMode('register');
-document.getElementById('togglePass').onclick = () => {
-  password.type = password.type === 'password' ? 'text' : 'password';
-};
-document.getElementById('forgotLink').onclick = (e) => {
-  e.preventDefault();
-  showMsg('Recuperação via suporte: @hipolitoofc', 'ok');
-};
-function showMsg(text, type) {
-  msg.textContent = text;
-  msg.className = 'notice ' + (type === 'ok' ? 'ok' : (type === 'warn' ? 'warn' : 'error')) + ' show';
-}
-function hideMsg() { msg.className = 'notice'; }
-
-async function api(payload) {
-  const r = await fetch(location.pathname, {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest'},
-    body: JSON.stringify({...payload, csrf: CSRF, honeypot: hp.value}),
-    credentials: 'same-origin'
-  });
-  const txt = await r.text();
-  try { return JSON.parse(txt); }
-  catch (e) { console.error('Resposta inválida:', txt); return {ok:false,error:'Erro no servidor'}; }
-}
-
-document.getElementById('authForm').onsubmit = async (e) => {
-  e.preventDefault();
-  hideMsg();
-  const mode = modeInput.value;
-  const u = username.value.trim();
-  const p = password.value;
-  if (!u || u.length < 3) return showMsg('Usuário com mínimo 3 caracteres.', 'error');
-  if (!p || p.length < 8) return showMsg('Senha com mínimo 8 caracteres.', 'error');
-  if (mode === 'register' && p !== confirmInput.value) return showMsg('As senhas não coincidem.', 'error');
-  btn.disabled = true;
-  submitText.textContent = mode === 'register' ? 'CRIANDO...' : 'ENTRANDO...';
-  try {
-    const payload = mode === 'register'
-      ? {action:'register', username:u, password:p, confirm:confirmInput.value}
-      : {action:'login', username:u, password:p};
-    const j = await api(payload);
-    if (j.ok) {
-      showMsg(mode === 'register' ? '✅ Conta criada! Entrando...' : '✅ Login OK! Entrando...', 'ok');
-      setTimeout(() => { location.href = j.redirect || 'index.php'; }, 400);
-    } else {
-      showMsg(j.error || 'Erro', 'error');
-      btn.disabled = false;
-      submitText.textContent = mode === 'register' ? 'CRIAR MINHA CONTA' : 'ACESSAR MINHA CONTA';
-    }
-  } catch (err) {
-    showMsg('Erro de conexão. Tente novamente.', 'error');
-    btn.disabled = false;
-    submitText.textContent = mode === 'register' ? 'CRIAR MINHA CONTA' : 'ACESSAR MINHA CONTA';
-  }
-};
+function showAdminTab(id, el){document.querySelectorAll('.admin-tab').forEach(t=>t.classList.remove('active'));document.querySelectorAll('.admin-content').forEach(c=>c.classList.remove('active'));document.getElementById('ac-'+id).classList.add('active');el.classList.add('active')}
+async function adminPost(payload){const r=await fetch('index.php',{method:'POST',headers:{'Content-Type':'application/json','X-Requested-With':'XMLHttpRequest'},body:JSON.stringify({...payload,csrf:CSRF}),credentials:'same-origin'});const t=await r.text();try{return JSON.parse(t)}catch(e){return{ok:false,error:'Erro'}}}
+async function adminBalance(mode,uid){const inp=document.getElementById('add-'+uid);const v=parseFloat(inp.value);if(!v||v<=0)return alert('Valor inválido');if(!confirm((mode==='add'?'Adicionar':'Remover')+' R$ '+v.toFixed(2)+' do user #'+uid+'?'))return;const j=await adminPost({action:'admin_action',sub:mode==='add'?'add_balance':'rem_balance',user_id:uid,amount:v});if(j.ok){alert('✅ Novo saldo: R$ '+j.balance.toFixed(2));location.reload()}else alert('❌ '+j.error)}
+async function adminDelUser(uid,name){if(!confirm('DELETAR usuário "'+name+'"?'))return;if(!confirm('TEM CERTEZA?'))return;const j=await adminPost({action:'admin_action',sub:'delete_user',user_id:uid});if(j.ok){alert('✅ Deletado');location.reload()}else alert('❌ '+j.error)}
 </script>
-<?php else: ?>
-
+<?php elseif ($user): ?>
 <nav class="dash-nav">
     <div class="brand">
-        <div class="brand-mark" style="width:34px;height:34px;border-radius:10px;font-size:16px">⚡</div>
-        HIPÓLITO <span style="color:var(--lime)">CLT</span>
+        <div class="brand-mark">⚡</div>
+        <b>HIPÓLITO <span style="color:var(--lime)">CLT</span></b>
     </div>
     <div class="right">
         <div class="bal-pill"><span class="lbl">Saldo</span><span class="val" id="bal"><?= fmtMoney((float)$user['balance']) ?></span></div>
         <div class="user-pill"><div class="av"><?= strtoupper(substr($user['username'],0,1)) ?></div><span class="nm"><?= esc($user['username']) ?></span></div>
+        <?php if (!empty($_SESSION['admin'])): ?>
+        <a href="?admin=1" style="padding:9px 14px;background:rgba(200,255,82,.1);border:1px solid rgba(200,255,82,.3);border-radius:10px;color:var(--lime);font-size:11px;font-weight:700;text-decoration:none;text-transform:uppercase;letter-spacing:.5px">⚡ Admin</a>
+        <?php endif; ?>
         <a href="?logout" class="btn-out">Sair</a>
     </div>
 </nav>
@@ -836,7 +1038,7 @@ document.getElementById('authForm').onsubmit = async (e) => {
     <div class="card">
         <div class="card-title">💳 Adicionar Saldo</div>
         <div class="deposit-row">
-            <input type="number" id="dep-amount" min="<?= DEP_MIN ?>" max="<?= DEP_MAX ?>" step="0.01" value="20" placeholder="Valor">
+            <input type="number" id="dep-amount" min="<?= DEP_MIN ?>" max="<?= DEP_MAX ?>" step="0.01" value="20">
             <button class="btn btn-primary" id="btn-pix" onclick="criarPix()">💰 Gerar PIX</button>
         </div>
         <div class="deposit-hint">Mínimo <?= fmtMoney(DEP_MIN) ?> · Máximo <?= fmtMoney(DEP_MAX) ?> · Via PIX</div>
@@ -899,172 +1101,130 @@ const PIX_DATA = <?= json_encode($pixData) ?>;
 let curType='gate', curGate='', running=false, curBalance=<?= (float)$user['balance'] ?>;
 let pixCountdownInterval = null;
 
-async function api(payload) {
-  const r = await fetch(location.pathname, {
-    method:'POST',
-    headers:{'Content-Type':'application/json', 'X-Requested-With':'XMLHttpRequest'},
-    body: JSON.stringify({...payload, csrf: CSRF}),
-    credentials:'same-origin'
-  });
-  const txt = await r.text();
-  try { return JSON.parse(txt); }
-  catch(e){ console.error('Não-JSON:', txt); return {ok:false,error:'Resposta inválida do servidor'}; }
-}
+async function api(payload){const r=await fetch('index.php',{method:'POST',headers:{'Content-Type':'application/json','X-Requested-With':'XMLHttpRequest'},body:JSON.stringify({...payload,csrf:CSRF}),credentials:'same-origin'});const t=await r.text();try{return JSON.parse(t)}catch(e){console.error(t);return{ok:false,error:'Erro servidor'}}}
 
-function setType(t){
-  curType=t; curGate='';
-  document.querySelectorAll('.type-tab').forEach(x=>x.classList.remove('active'));
-  document.querySelectorAll('.type-tab')[t==='gate'?0:1].classList.add('active');
-  document.getElementById('label-lista').textContent = t==='gate'?'Cartões (NÚMERO|MÊS|ANO|CVV)':'Logins (USUÁRIO:SENHA)';
-  document.getElementById('lista').placeholder = t==='gate'?'4532015112830366|12|2027|123':'usuario:senha';
-  renderGates();
-  document.getElementById('btn-run').disabled = true;
-}
+function setType(t){curType=t;curGate='';document.querySelectorAll('.type-tab').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.type-tab')[t==='gate'?0:1].classList.add('active');document.getElementById('label-lista').textContent=t==='gate'?'Cartões (NÚMERO|MÊS|ANO|CVV)':'Logins (USUÁRIO:SENHA)';document.getElementById('lista').placeholder=t==='gate'?'4532015112830366|12|2027|123':'usuario:senha';renderGates();document.getElementById('btn-run').disabled=true}
 
-function renderGates(){
-  const box=document.getElementById('gates'), arr=GATES[curType]||[];
-  box.innerHTML='';
-  if(!arr.length){box.innerHTML='<div style="grid-column:1/-1;text-align:center;padding:24px;color:var(--muted);font-size:12px">Nenhum checker em /'+curType+'/ ainda</div>';return}
-  arr.forEach(f=>{
-    const d=document.createElement('div'); d.className='gate-card';
-    d.innerHTML=`<div class="top"><div class="nm">${f}</div><div class="ext">${f.split('.').pop()}</div></div><div class="tp">${curType==='gate'?'Cartão':'Login'}</div>`;
-    d.onclick=()=>{curGate=f;document.querySelectorAll('.gate-card').forEach(x=>x.classList.remove('sel'));d.classList.add('sel');document.getElementById('btn-run').disabled=false};
-    box.appendChild(d);
-  });
-}
+function renderGates(){const box=document.getElementById('gates'),arr=GATES[curType]||[];box.innerHTML='';if(!arr.length){box.innerHTML='<div style="grid-column:1/-1;text-align:center;padding:24px;color:var(--muted);font-size:12px">Nenhum checker em /'+curType+'/</div>';return}arr.forEach(f=>{const d=document.createElement('div');d.className='gate-card';d.innerHTML=`<div class="top"><div class="nm">${f}</div><div class="ext">${f.split('.').pop()}</div></div><div class="tp">${curType==='gate'?'Cartão':'Login'}</div>`;d.onclick=()=>{curGate=f;document.querySelectorAll('.gate-card').forEach(x=>x.classList.remove('sel'));d.classList.add('sel');document.getElementById('btn-run').disabled=false};box.appendChild(d)})}
 
-function showPixMsg(text, type){
-  const m = document.getElementById('pix-msg');
-  m.textContent = text;
-  m.className = 'notice ' + (type === 'ok' ? 'ok' : (type === 'warn' ? 'warn' : 'error')) + ' show';
-}
+function showPixMsg(t,type){const m=document.getElementById('pix-msg');m.textContent=t;m.className='notice '+(type==='ok'?'ok':(type==='warn'?'warn':'error'))+' show'}
 
-async function checarPixPermitido(){
-  try {
-    const j = await api({action:'pix_allowed'});
-    const btn = document.getElementById('btn-pix');
-    const msg = document.getElementById('pix-msg');
-    if (j.ok && !j.allowed) {
-      btn.disabled = true;
-      const wait = j.wait || 0;
-      const min = Math.ceil(wait / 60);
-      if (j.pending && j.pending.qr) {
-        showPixMsg('⏳ Você tem um PIX pendente. Aguarde o pagamento ou ' + min + ' min para gerar outro.', 'warn');
-        if (confirm('Deseja abrir o PIX pendente agora?')) {
-          document.getElementById('pix-img').src = j.pending.qr;
-          document.getElementById('pix-copy').textContent = j.pending.copy;
-          document.getElementById('pix-sub').textContent = 'Valor: R$ ' + j.pending.amount.toFixed(2).replace('.',',');
-          document.getElementById('pix-modal').classList.add('show');
-          monitorPix(j.pending.txid);
-        }
-      } else {
-        showPixMsg('⏳ Aguarde ' + min + ' min para gerar outro PIX.', 'warn');
-      }
-    } else {
-      btn.disabled = false;
-      msg.className = 'notice';
-    }
-  } catch(e){}
-}
+async function checarPixPermitido(){try{const j=await api({action:'pix_allowed'});const btn=document.getElementById('btn-pix');const msg=document.getElementById('pix-msg');if(j.ok&&!j.allowed){btn.disabled=true;const min=Math.ceil((j.wait||0)/60);if(j.pending&&j.pending.qr){showPixMsg('⏳ PIX pendente. Aguarde pagar ou '+min+' min.',(type='warn'));if(confirm('Abrir PIX pendente?')){document.getElementById('pix-img').src=j.pending.qr;document.getElementById('pix-copy').textContent=j.pending.copy;document.getElementById('pix-sub').textContent='Valor: R$ '+j.pending.amount.toFixed(2).replace('.',',');document.getElementById('pix-modal').classList.add('show');monitorPix(j.pending.txid)}}else showPixMsg('⏳ Aguarde '+min+' min.',(type='warn'))}else{btn.disabled=false;msg.className='notice'}}catch(e){}}
 
-async function criarPix(){
-  const amt=parseFloat(document.getElementById('dep-amount').value);
-  if(!amt||amt<<?= DEP_MIN ?>||amt><?= DEP_MAX ?>) return showPixMsg('Valor entre <?= fmtMoney(DEP_MIN) ?> e <?= fmtMoney(DEP_MAX) ?>', 'error');
-  try{
-    const j=await api({action:'deposit',amount:amt});
-    if(!j.ok){ showPixMsg(j.error||'Erro', 'error'); return; }
-    document.getElementById('pix-img').src=j.qr;
-    document.getElementById('pix-copy').textContent=j.copy;
-    document.getElementById('pix-sub').textContent='Valor: R$ '+j.amount.toFixed(2).replace('.',',');
-    document.getElementById('pix-modal').classList.add('show');
-    document.getElementById('pix-msg').className='notice';
-    monitorPix(j.txid);
-  }catch(e){showPixMsg('Erro de conexão', 'error')}
-}
+async function criarPix(){const amt=parseFloat(document.getElementById('dep-amount').value);if(!amt||amt<<?= DEP_MIN ?>||amt><?= DEP_MAX ?>)return showPixMsg('Valor entre <?= fmtMoney(DEP_MIN) ?> e <?= fmtMoney(DEP_MAX) ?>','error');try{const j=await api({action:'deposit',amount:amt});if(!j.ok){showPixMsg(j.error||'Erro','error');return}document.getElementById('pix-img').src=j.qr;document.getElementById('pix-copy').textContent=j.copy;document.getElementById('pix-sub').textContent='Valor: R$ '+j.amount.toFixed(2).replace('.',',');document.getElementById('pix-modal').classList.add('show');document.getElementById('pix-msg').className='notice';monitorPix(j.txid)}catch(e){showPixMsg('Erro conexão','error')}}
 
-function monitorPix(txid){
-  const start = Date.now();
-  if (pixCountdownInterval) clearInterval(pixCountdownInterval);
-  pixCountdownInterval = setInterval(() => {
-    const el = document.getElementById('pix-timer');
-    if (el) {
-      const elapsed = Math.floor((Date.now() - start) / 1000);
-      const left = Math.max(0, PIX_COOLDOWN - elapsed);
-      if (left > 0) {
-        const m = Math.floor(left / 60), s = left % 60;
-        el.textContent = 'Expira em ' + String(m).padStart(2,'0') + ':' + String(s).padStart(2,'0');
-      } else {
-        el.textContent = 'PIX expirado. Você pode gerar outro.';
-        clearInterval(pixCountdownInterval);
-      }
-    }
-  }, 1000);
+function monitorPix(txid){const start=Date.now();if(pixCountdownInterval)clearInterval(pixCountdownInterval);pixCountdownInterval=setInterval(()=>{const el=document.getElementById('pix-timer');if(el){const elapsed=Math.floor((Date.now()-start)/1000);const left=Math.max(0,PIX_COOLDOWN-elapsed);if(left>0){const m=Math.floor(left/60),s=left%60;el.textContent='Expira em '+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0')}else{el.textContent='Expirado. Gere outro.';clearInterval(pixCountdownInterval)}}},1000);const iv=setInterval(async()=>{if(!document.getElementById('pix-modal').classList.contains('show')){clearInterval(iv);if(pixCountdownInterval)clearInterval(pixCountdownInterval);return}try{const j=await api({action:'status',txid:txid});if(j.ok&&j.status==='paid'){clearInterval(iv);if(pixCountdownInterval)clearInterval(pixCountdownInterval);document.getElementById('pix-sub').textContent='✅ Pago! Atualizando...';document.getElementById('pix-sub').style.color='var(--lime)';setTimeout(()=>{closePix();location.reload()},1500)}else if(j.ok&&j.status==='expired'){clearInterval(iv);if(pixCountdownInterval)clearInterval(pixCountdownInterval);document.getElementById('pix-sub').textContent='⏱ Expirado'}}catch(e){}},4000)}
 
-  const iv=setInterval(async()=>{
-    if(!document.getElementById('pix-modal').classList.contains('show')){clearInterval(iv);if(pixCountdownInterval)clearInterval(pixCountdownInterval);return}
-    try{const j=await api({action:'status',txid:txid});
-      if(j.ok&&j.status==='paid'){
-        clearInterval(iv); if(pixCountdownInterval)clearInterval(pixCountdownInterval);
-        document.getElementById('pix-sub').textContent='✅ Pago! Saldo atualizado';
-        document.getElementById('pix-sub').style.color='var(--lime)';
-        document.getElementById('pix-timer').textContent='';
-        setTimeout(()=>{closePix();location.reload()},1500);
-      } else if (j.ok && j.status === 'expired') {
-        clearInterval(iv); if(pixCountdownInterval)clearInterval(pixCountdownInterval);
-        document.getElementById('pix-sub').textContent='⏱ PIX expirado';
-        document.getElementById('pix-timer').textContent='Você pode gerar outro agora';
-      }
-    }catch(e){}
-  },4000);
-}
-
-function closePix(){
-  document.getElementById('pix-modal').classList.remove('show');
-  if(pixCountdownInterval) clearInterval(pixCountdownInterval);
-  checarPixPermitido();
-}
-
+function closePix(){document.getElementById('pix-modal').classList.remove('show');if(pixCountdownInterval)clearInterval(pixCountdownInterval);checarPixPermitido()}
 function copyPix(){const t=document.getElementById('pix-copy').textContent;navigator.clipboard.writeText(t).then(()=>{const el=document.getElementById('pix-copy');el.style.borderColor='var(--lime)';setTimeout(()=>el.style.borderColor='#c8ff5240',1000)})}
 
-async function runCheck(){
-  if(!curGate) return alert('Escolha um checker');
-  const lista=document.getElementById('lista').value.trim();
-  if(!lista) return alert('Cole os dados');
-  const items=lista.split('\n').filter(l=>l.trim());
-  if(!items.length) return;
-  running=true; let idx=0,live=0,die=0;
-  clearAll();
-  while(running && idx<items.length){
-    const it=items[idx];
-    try{
-      const j=await api({action:'check',gate:curGate,type:curType,lista:it});
-      if(!j.ok){addRes(it,'❌ '+(j.error||'Erro'),false);die++}
-      else{addRes(it,j.response,j.live);if(j.live)live++;else die++;curBalance=j.balance;document.getElementById('bal').textContent='R$ '+j.balance.toFixed(2).replace('.',',')}
-    }catch(e){addRes(it,'❌ Erro conexão',false);die++}
-    idx++;
-    document.getElementById('st-proc').textContent=idx;
-    document.getElementById('st-live').textContent=live;
-    document.getElementById('st-die').textContent=die;
-    if(running && idx<items.length) await new Promise(r=>setTimeout(r,1500));
-  }
-  running=false;
-}
+async function runCheck(){if(!curGate)return alert('Escolha um checker');const lista=document.getElementById('lista').value.trim();if(!lista)return alert('Cole os dados');const items=lista.split('\n').filter(l=>l.trim());if(!items.length)return;running=true;let idx=0,live=0,die=0;clearAll();while(running&&idx<items.length){const it=items[idx];try{const j=await api({action:'check',gate:curGate,type:curType,lista:it});if(!j.ok){addRes(it,'❌ '+(j.error||'Erro'),false);die++}else{addRes(it,j.response,j.live);if(j.live)live++;else die++;curBalance=j.balance;document.getElementById('bal').textContent='R$ '+j.balance.toFixed(2).replace('.',',')}}catch(e){addRes(it,'❌ Erro conexão',false);die++}idx++;document.getElementById('st-proc').textContent=idx;document.getElementById('st-live').textContent=live;document.getElementById('st-die').textContent=die;if(running&&idx<items.length)await new Promise(r=>setTimeout(r,1500))}running=false}
+
 function stopCheck(){running=false}
 function clearAll(){document.getElementById('res-live').innerHTML='';document.getElementById('res-die').innerHTML='';document.getElementById('st-proc').textContent='0';document.getElementById('st-live').textContent='0';document.getElementById('st-die').textContent='0'}
-function addRes(input,resp,isLive){
-  const box=document.getElementById(isLive?'res-live':'res-die');
-  const d=document.createElement('div'); d.className='res-item '+(isLive?'live':'die');
-  d.innerHTML=`<div class="hd">${input.length>60?input.substring(0,60)+'...':input}</div><div class="body">${resp.replace(/</g,'&lt;')}</div>`;
-  box.insertBefore(d,box.firstChild);
+function addRes(input,resp,isLive){const box=document.getElementById(isLive?'res-live':'res-die');const d=document.createElement('div');d.className='res-item '+(isLive?'live':'die');d.innerHTML=`<div class="hd">${input.length>60?input.substring(0,60)+'...':input}</div><div class="body">${resp.replace(/</g,'&lt;')}</div>`;box.insertBefore(d,box.firstChild)}
+
+document.addEventListener('DOMContentLoaded',()=>{renderGates();checarPixPermitido();if(PIX_DATA){showPixMsg('⏳ Você tem PIX pendente: R$ '+PIX_DATA.amount.toFixed(2).replace('.',','),'warn')}});
+</script>
+
+<?php else: ?>
+<div class="orb"></div><div class="orb two"></div>
+<main class="shell">
+    <header class="topbar">
+        <div class="brand"><div class="brand-mark"><svg viewBox="0 0 24 24" fill="none"><path d="M5 18V6l7 8 7-8v12M5 6h14" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"/></svg></div>HIPÓLITO <span style="color:var(--lime)">CLT</span></div>
+        <div class="status"><i></i> Portal de acesso</div>
+    </header>
+    <section class="intro">
+        <div class="eyebrow">Seu próximo nível começa aqui</div>
+        <h1>Trabalho sério.<br><span>Outro nível.</span></h1>
+        <p class="lead">Seu espaço, suas ferramentas, sua evolução. Entre na plataforma e continue de onde parou.</p>
+        <div class="feature"><div class="feature-icon"><svg viewBox="0 0 24 24" fill="none"><path d="M12 3l7 3v5c0 4.5-3 7.5-7 10-4-2.5-7-5.5-7-10V6l7-3z" stroke="currentColor" stroke-width="1.7"/><path d="M9 12l2 2 4-4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></div><div><strong>Seu espaço protegido</strong><small>Acesso pessoal em uma interface simples e direta.</small></div></div>
+    </section>
+    <section class="auth-wrap">
+        <div class="auth-card">
+            <div class="card-kicker">Bem-vindo à plataforma</div>
+            <h2 id="formTitle">Que bom ter você.</h2>
+            <p class="sub" id="formSub">Entre com seus dados para acessar sua conta.</p>
+            <div class="tabs" role="tablist">
+                <button class="tab active" type="button" id="loginTab">Entrar</button>
+                <button class="tab" type="button" id="registerTab">Criar conta</button>
+                <button class="tab" type="button" id="adminTab">Admin</button>
+            </div>
+            <div class="notice" id="msg"></div>
+            <form id="authForm" autocomplete="off" onsubmit="return false;">
+                <input type="hidden" name="mode" id="modeInput" value="login">
+                <input type="text" name="website" id="hp_field" tabindex="-1" autocomplete="off" style="position:absolute;left:-9999px;width:1px;height:1px;opacity:0;pointer-events:none" aria-hidden="true">
+                <div class="field"><label for="username">Usuário</label><div class="input-wrap"><svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="8" r="4" stroke="currentColor" stroke-width="1.7"/><path d="M4 20c.8-4 3.5-6 8-6s7.2 2 8 6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg><input id="username" name="username" type="text" autocomplete="username" placeholder="Digite seu usuário" minlength="3" maxlength="20" required></div></div>
+                <div class="field"><label for="password">Senha</label><div class="input-wrap"><svg viewBox="0 0 24 24" fill="none"><rect x="4" y="10" width="16" height="11" rx="2" stroke="currentColor" stroke-width="1.7"/><path d="M8 10V7a4 4 0 018 0v3" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg><input id="password" name="password" type="password" autocomplete="current-password" placeholder="Digite sua senha" minlength="8" required><button class="toggle-pass" type="button" id="togglePass"><svg viewBox="0 0 24 24" fill="none"><path d="M2.5 12s3.3-6 9.5-6 9.5 6 9.5 6-3.3 6-9.5 6-9.5-6-9.5-6z" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="12" r="2.5" stroke="currentColor" stroke-width="1.6"/></svg></button></div></div>
+                <div class="field" id="confirmField" hidden><label for="confirm_password">Confirmar senha</label><div class="input-wrap"><svg viewBox="0 0 24 24" fill="none"><rect x="4" y="10" width="16" height="11" rx="2" stroke="currentColor" stroke-width="1.7"/><path d="M8 10V7a4 4 0 018 0v3" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg><input id="confirm_password" name="confirm_password" type="password" autocomplete="new-password" placeholder="Repita a senha" minlength="8"></div></div>
+                <button class="submit" type="submit" id="submitBtn"><span id="submitText">ACESSAR MINHA CONTA</span><svg viewBox="0 0 24 24" fill="none"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+            </form>
+            <div class="security"><svg viewBox="0 0 24 24" fill="none"><path d="M12 3l7 3v5c0 4.5-3 7.5-7 10-4-2.5-7-5.5-7-10V6l7-3z" stroke="currentColor" stroke-width="1.7"/><path d="M9 12l2 2 4-4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg> Seus dados são protegidos</div>
+        </div>
+    </section>
+    <footer class="foot"><span>© <?= date('Y') ?> Hipólito CLT</span><span>FEITO PARA IR ALÉM</span></footer>
+</main>
+<script>
+const CSRF = <?= json_encode($csrf) ?>;
+const loginTab = document.getElementById('loginTab'), registerTab = document.getElementById('registerTab'), adminTab = document.getElementById('adminTab');
+const modeInput = document.getElementById('modeInput'), confirmField = document.getElementById('confirmField'), confirmInput = document.getElementById('confirm_password');
+const title = document.getElementById('formTitle'), sub = document.getElementById('formSub'), submitText = document.getElementById('submitText');
+const password = document.getElementById('password'), username = document.getElementById('username'), msg = document.getElementById('msg'), btn = document.getElementById('submitBtn'), hp = document.getElementById('hp_field');
+let currentMode = 'login';
+
+function setMode(mode) {
+    currentMode = mode;
+    const register = mode === 'register';
+    const admin = mode === 'admin';
+    modeInput.value = mode;
+    loginTab.classList.toggle('active', !register && !admin);
+    registerTab.classList.toggle('active', register);
+    adminTab.classList.toggle('active', admin);
+    confirmField.hidden = !register;
+    confirmInput.required = register;
+    title.textContent = register ? 'Crie seu acesso.' : (admin ? 'Acesso administrativo.' : 'Que bom ter você.');
+    sub.textContent = register ? 'Preencha os dados para começar.' : (admin ? 'Entre com suas credenciais de admin.' : 'Entre com seus dados para acessar.');
+    submitText.textContent = register ? 'CRIAR MINHA CONTA' : (admin ? 'ACESSAR PAINEL ADMIN' : 'ACESSAR MINHA CONTA');
+    password.autocomplete = register ? 'new-password' : 'current-password';
+    hideMsg();
+}
+loginTab.onclick = () => setMode('login');
+registerTab.onclick = () => setMode('register');
+adminTab.onclick = () => setMode('admin');
+document.getElementById('togglePass').onclick = () => { password.type = password.type === 'password' ? 'text' : 'password' };
+
+function showMsg(t, type) { msg.textContent = t; msg.className = 'notice ' + (type === 'ok' ? 'ok' : (type === 'warn' ? 'warn' : 'error')) + ' show'; }
+function hideMsg() { msg.className = 'notice'; }
+
+async function api(payload) {
+    const r = await fetch('index.php', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' }, body: JSON.stringify({ ...payload, csrf: CSRF, honeypot: hp.value }), credentials: 'same-origin' });
+    const t = await r.text();
+    try { return JSON.parse(t); } catch (e) { console.error(t); return { ok: false, error: 'Erro servidor' }; }
 }
 
-document.addEventListener('DOMContentLoaded',()=>{
-  renderGates();
-  checarPixPermitido();
-  if (PIX_DATA) {
-    showPixMsg('⏳ Você tem um PIX pendente safado ' + ('R$ ' + PIX_DATA.amount.toFixed(2).replace('.',',')), 'warn');
-  }
-});
+document.getElementById('authForm').onsubmit = async (e) => {
+    e.preventDefault(); hideMsg();
+    const u = username.value.trim(), p = password.value;
+    if (currentMode === 'admin') {
+        btn.disabled = true; submitText.textContent = 'ENTRANDO...';
+        try {
+            const j = await api({ action: 'admin_login', username: u, password: p });
+            if (j.ok) { showMsg('✅ Admin OK!', 'ok'); setTimeout(() => location.href = j.redirect, 400); }
+            else { showMsg(j.error || 'Erro', 'error'); btn.disabled = false; submitText.textContent = 'ACESSAR PAINEL ADMIN'; }
+        } catch (err) { showMsg('Erro conexão', 'error'); btn.disabled = false; submitText.textContent = 'ACESSAR PAINEL ADMIN'; }
+        return;
+    }
+    if (!u || u.length < 3) return showMsg('Usuário 3+ chars.', 'error');
+    if (!p || p.length < 8) return showMsg('Senha 8+ chars.', 'error');
+    if (currentMode === 'register' && p !== confirmInput.value) return showMsg('Senhas não coincidem.', 'error');
+    btn.disabled = true; submitText.textContent = currentMode === 'register' ? 'CRIANDO...' : 'ENTRANDO...';
+    try {
+        const payload = currentMode === 'register' ? { action: 'register', username: u, password: p, confirm: confirmInput.value } : { action: 'login', username: u, password: p };
+        const j = await api(payload);
+        if (j.ok) { showMsg('✅ OK! Entrando...', 'ok'); setTimeout(() => location.href = j.redirect || 'index.php', 400); }
+        else { showMsg(j.error || 'Erro', 'error'); btn.disabled = false; submitText.textContent = currentMode === 'register' ? 'CRIAR MINHA CONTA' : 'ACESSAR MINHA CONTA'; }
+    } catch (err) { showMsg('Erro conexão', 'error'); btn.disabled = false; submitText.textContent = currentMode === 'register' ? 'CRIAR MINHA CONTA' : 'ACESSAR MINHA CONTA'; }
+};
 </script>
 <?php endif; ?>
 </body>
