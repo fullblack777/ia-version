@@ -1062,7 +1062,7 @@ document.addEventListener('DOMContentLoaded',()=>{
   renderGates();
   checarPixPermitido();
   if (PIX_DATA) {
-    showPixMsg('⏳ Você tem um PIX pendente de ' + ('R$ ' + PIX_DATA.amount.toFixed(2).replace('.',',')), 'warn');
+    showPixMsg('⏳ Você tem um PIX pendente safado ' + ('R$ ' + PIX_DATA.amount.toFixed(2).replace('.',',')), 'warn');
   }
 });
 </script>
