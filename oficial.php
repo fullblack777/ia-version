@@ -434,6 +434,109 @@ function listAudit(int $limit = 100): array {
     return $out;
 }
 
+/**
+ * Executa um gate PHP em subprocesso isolado (PHP CLI).
+ * Vantagens: exit/die do gate não mata o script principal;
+ * header()/ob_* do gate não poluem a resposta JSON;
+ * erros fatais ficam no stderr e não quebram o JSON final.
+ */
+function runGatePhp(string $path, string $lista, string $gateName): string {
+    $phpBin = PHP_BINARY ?: 'php';
+    // Fallback: se PHP_BINARY não existir no ambiente (ex.: Render), tenta 'php'
+    if (!is_file($phpBin) && !is_executable($phpBin)) {
+        $phpBin = 'php';
+    }
+
+    $descriptors = [
+        0 => ['pipe', 'r'], // stdin
+        1 => ['pipe', 'w'], // stdout
+        2 => ['pipe', 'w'], // stderr
+    ];
+
+    // Env: passa lista via GET também, caso o gate dependa de $_GET
+    $env = $_ENV;
+    $env['GATE_LISTA'] = $lista;
+    $env['GATE_NAME']  = $gateName;
+    $env['QUERY_STRING'] = http_build_query(['lista' => $lista, 'gate' => $gateName]);
+
+    $cmd = escapeshellarg($phpBin)
+         . ' -d display_errors=0'
+         . ' -d log_errors=0'
+         . ' -d error_reporting=0'
+         . ' ' . escapeshellarg($path)
+         . ' ' . escapeshellarg($lista);
+
+    $proc = @proc_open($cmd, $descriptors, $pipes, dirname($path), $env);
+    if (!is_resource($proc)) {
+        // Se proc_open falhar (ex.: desabilitado), cai pro shell_exec simples
+        $out = @shell_exec(escapeshellarg($phpBin) . ' ' . escapeshellarg($path) . ' ' . escapeshellarg($lista) . ' 2>&1');
+        return $out !== null ? (string)$out : '❌ Sem resposta do checker';
+    }
+
+    // Fecha stdin imediatamente (gate não deve ler input interativo)
+    fclose($pipes[0]);
+
+    stream_set_blocking($pipes[1], false);
+    stream_set_blocking($pipes[2], false);
+
+    $stdout = '';
+    $stderr = '';
+    $start = time();
+    $timeout = 60; // segundos máx por gate
+
+    while (true) {
+        $status = proc_get_status($proc);
+        $read = [$pipes[1], $pipes[2]];
+        $write = null; $except = null;
+        if (@stream_select($read, $write, $except, 0, 200000) > 0) {
+            foreach ($read as $s) {
+                $chunk = fread($s, 8192);
+                if ($chunk === false) continue;
+                if ($s === $pipes[1]) $stdout .= $chunk;
+                else $stderr .= $chunk;
+            }
+        }
+        if (!$status['running']) {
+            // drena o restante
+            $stdout .= stream_get_contents($pipes[1]) ?: '';
+            $stderr .= stream_get_contents($pipes[2]) ?: '';
+            break;
+        }
+        if (time() - $start > $timeout) {
+            @proc_terminate($proc, 9);
+            $stdout .= "\n⏱ Timeout de {$timeout}s no checker.";
+            break;
+        }
+    }
+
+    @fclose($pipes[1]);
+    @fclose($pipes[2]);
+    @proc_close($proc);
+
+    $out = trim($stdout);
+    if ($out === '' && $stderr !== '') {
+        // Se stdout vazio e stderr com erro, mostra erro resumido
+        $out = '❌ Erro no checker: ' . trim(substr($stderr, 0, 500));
+    }
+    if ($out === '') {
+        $out = '❌ Sem resposta do checker';
+    }
+    return $out;
+}
+
+/**
+ * Executa gate Python em subprocesso isolado.
+ */
+function runGatePython(string $path, string $lista): string {
+    $pyBin = 'python3';
+    $cmd = escapeshellarg($pyBin) . ' ' . escapeshellarg($path) . ' ' . escapeshellarg($lista) . ' 2>&1';
+    $out = @shell_exec($cmd);
+    if ($out === null) $out = '❌ Sem resposta do checker';
+    $out = trim((string)$out);
+    if ($out === '') $out = '❌ Sem resposta do checker';
+    return $out;
+}
+
 $ip = clientIp();
 
 if (isset($_GET['action']) && $_GET['action'] === 'ping') { header('Content-Type: text/plain'); echo 'OK:' . time(); exit; }
@@ -658,18 +761,18 @@ try {
                 $path = $dir . '/' . $gate;
                 $ext = strtolower(pathinfo($path, PATHINFO_EXTENSION));
                 if ((float)$user['balance'] < DIE_COST) jsonOut(['ok' => false, 'error' => 'Saldo insuficiente. Deposite primeiro.']);
-                $_SESSION['user_id'] = (int)$user['id'];
-                $_SESSION['username'] = $user['username'];
+
+                // ====== CORREÇÃO: executa em subprocesso isolado ======
                 $response = '';
                 if ($ext === 'php') {
-                    $_GET['lista'] = $lista;
-                    $_GET['gate']  = $gate;
-                    ob_start();
-                    try { include $path; $response = ob_get_clean(); }
-                    catch (Throwable $e) { ob_end_clean(); $response = '❌ Erro: ' . $e->getMessage(); }
+                    $response = runGatePhp($path, $lista, $gate);
+                } elseif ($ext === 'py') {
+                    $response = runGatePython($path, $lista);
                 } else {
-                    $response = shell_exec('python3 ' . escapeshellarg($path) . ' ' . escapeshellarg($lista) . ' 2>&1') ?? '❌ Sem resposta';
+                    jsonOut(['ok' => false, 'error' => 'Extensão não suportada']);
                 }
+                // =====================================================
+
                 $rl = strtolower($response);
                 $liveWords = ['✅','aprovada','approved','success','live','autorizado','valid','aprovado','apvd','ativa','active','cvv','saldo'];
                 $isLive = false;
@@ -838,7 +941,6 @@ textarea.lista:focus{border-color:var(--lime);box-shadow:0 0 0 3px #c8ff5215}
 @keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.4;transform:scale(.85)}}
 .pix-timer{margin-top:10px;text-align:center;font-size:11px;color:var(--muted);font-family:'Courier New',monospace}
 
-/* ===== ADMIN ===== */
 .admin-wrap{max-width:1400px;margin:0 auto;padding:24px}
 .admin-top{display:flex;align-items:center;justify-content:space-between;padding:16px 24px;margin-bottom:24px;background:rgba(20,25,22,.85);border:1px solid var(--line);border-radius:16px;flex-wrap:wrap;gap:12px}
 .admin-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:20px}
@@ -1105,11 +1207,30 @@ async function api(payload){const r=await fetch('index.php',{method:'POST',heade
 
 function setType(t){curType=t;curGate='';document.querySelectorAll('.type-tab').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.type-tab')[t==='gate'?0:1].classList.add('active');document.getElementById('label-lista').textContent=t==='gate'?'Cartões (NÚMERO|MÊS|ANO|CVV)':'Logins (USUÁRIO:SENHA)';document.getElementById('lista').placeholder=t==='gate'?'4532015112830366|12|2027|123':'usuario:senha';renderGates();document.getElementById('btn-run').disabled=true}
 
-function renderGates(){const box=document.getElementById('gates'),arr=GATES[curType]||[];box.innerHTML='';if(!arr.length){box.innerHTML='<div style="grid-column:1/-1;text-align:center;padding:24px;color:var(--muted);font-size:12px">Nenhum checker em /'+curType+'/</div>';return}arr.forEach(f=>{const d=document.createElement('div');d.className='gate-card';d.innerHTML=`<div class="top"><div class="nm">${f}</div><div class="ext">${f.split('.').pop()}</div></div><div class="tp">${curType==='gate'?'Cartão':'Login'}</div>`;d.onclick=()=>{curGate=f;document.querySelectorAll('.gate-card').forEach(x=>x.classList.remove('sel'));d.classList.add('sel');document.getElementById('btn-run').disabled=false};box.appendChild(d)})}
+function renderGates(){
+    const box=document.getElementById('gates'),arr=GATES[curType]||[];
+    box.innerHTML='';
+    if(!arr.length){box.innerHTML='<div style="grid-column:1/-1;text-align:center;padding:24px;color:var(--muted);font-size:12px">Nenhum checker em /'+curType+'/</div>';return}
+    arr.forEach(f=>{
+        // CORREÇÃO: exibe nome sem extensão no card, mantém extensão no badge
+        const displayName = f.replace(/\.(php|py)$/i, '');
+        const ext = f.split('.').pop();
+        const d=document.createElement('div');
+        d.className='gate-card';
+        d.innerHTML=`<div class="top"><div class="nm">${displayName}</div><div class="ext">${ext}</div></div><div class="tp">${curType==='gate'?'Cartão':'Login'}</div>`;
+        d.onclick=()=>{
+            curGate=f;
+            document.querySelectorAll('.gate-card').forEach(x=>x.classList.remove('sel'));
+            d.classList.add('sel');
+            document.getElementById('btn-run').disabled=false;
+        };
+        box.appendChild(d);
+    });
+}
 
 function showPixMsg(t,type){const m=document.getElementById('pix-msg');m.textContent=t;m.className='notice '+(type==='ok'?'ok':(type==='warn'?'warn':'error'))+' show'}
 
-async function checarPixPermitido(){try{const j=await api({action:'pix_allowed'});const btn=document.getElementById('btn-pix');const msg=document.getElementById('pix-msg');if(j.ok&&!j.allowed){btn.disabled=true;const min=Math.ceil((j.wait||0)/60);if(j.pending&&j.pending.qr){showPixMsg('⏳ PIX pendente. Aguarde pagar ou '+min+' min.',(type='warn'));if(confirm('Abrir PIX pendente?')){document.getElementById('pix-img').src=j.pending.qr;document.getElementById('pix-copy').textContent=j.pending.copy;document.getElementById('pix-sub').textContent='Valor: R$ '+j.pending.amount.toFixed(2).replace('.',',');document.getElementById('pix-modal').classList.add('show');monitorPix(j.pending.txid)}}else showPixMsg('⏳ Aguarde '+min+' min.',(type='warn'))}else{btn.disabled=false;msg.className='notice'}}catch(e){}}
+async function checarPixPermitido(){try{const j=await api({action:'pix_allowed'});const btn=document.getElementById('btn-pix');const msg=document.getElementById('pix-msg');if(j.ok&&!j.allowed){btn.disabled=true;const min=Math.ceil((j.wait||0)/60);if(j.pending&&j.pending.qr){showPixMsg('⏳ PIX pendente. Aguarde pagar ou '+min+' min.','warn');if(confirm('Abrir PIX pendente?')){document.getElementById('pix-img').src=j.pending.qr;document.getElementById('pix-copy').textContent=j.pending.copy;document.getElementById('pix-sub').textContent='Valor: R$ '+j.pending.amount.toFixed(2).replace('.',',');document.getElementById('pix-modal').classList.add('show');monitorPix(j.pending.txid)}}else showPixMsg('⏳ Aguarde '+min+' min.','warn')}else{btn.disabled=false;msg.className='notice'}}catch(e){}}
 
 async function criarPix(){const amt=parseFloat(document.getElementById('dep-amount').value);if(!amt||amt<<?= DEP_MIN ?>||amt><?= DEP_MAX ?>)return showPixMsg('Valor entre <?= fmtMoney(DEP_MIN) ?> e <?= fmtMoney(DEP_MAX) ?>','error');try{const j=await api({action:'deposit',amount:amt});if(!j.ok){showPixMsg(j.error||'Erro','error');return}document.getElementById('pix-img').src=j.qr;document.getElementById('pix-copy').textContent=j.copy;document.getElementById('pix-sub').textContent='Valor: R$ '+j.amount.toFixed(2).replace('.',',');document.getElementById('pix-modal').classList.add('show');document.getElementById('pix-msg').className='notice';monitorPix(j.txid)}catch(e){showPixMsg('Erro conexão','error')}}
 
@@ -1122,7 +1243,7 @@ async function runCheck(){if(!curGate)return alert('Escolha um checker');const l
 
 function stopCheck(){running=false}
 function clearAll(){document.getElementById('res-live').innerHTML='';document.getElementById('res-die').innerHTML='';document.getElementById('st-proc').textContent='0';document.getElementById('st-live').textContent='0';document.getElementById('st-die').textContent='0'}
-function addRes(input,resp,isLive){const box=document.getElementById(isLive?'res-live':'res-die');const d=document.createElement('div');d.className='res-item '+(isLive?'live':'die');d.innerHTML=`<div class="hd">${input.length>60?input.substring(0,60)+'...':input}</div><div class="body">${resp.replace(/</g,'&lt;')}</div>`;box.insertBefore(d,box.firstChild)}
+function addRes(input,resp,isLive){const box=document.getElementById(isLive?'res-live':'res-die');const d=document.createElement('div');d.className='res-item '+(isLive?'live':'die');d.innerHTML=`<div class="hd">${input.length>60?input.substring(0,60)+'...':input}</div><div class="body">${String(resp).replace(/</g,'&lt;')}</div>`;box.insertBefore(d,box.firstChild)}
 
 document.addEventListener('DOMContentLoaded',()=>{renderGates();checarPixPermitido();if(PIX_DATA){showPixMsg('⏳ Você tem PIX pendente: R$ '+PIX_DATA.amount.toFixed(2).replace('.',','),'warn')}});
 </script>
